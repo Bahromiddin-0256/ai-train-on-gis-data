@@ -1,0 +1,50 @@
+# Data config: Sentinel-2 imagery + CropHarvest labels over Uzbekistan.
+#
+# For offline/CI runs, set `source: synthetic` (the DataModule will generate
+# tiny in-memory GeoTIFF fixtures instead of reading from disk).
+
+_target_: gis_train.data.datamodule.CropDataModule
+
+# One of: "cropharvest", "synthetic", "local"
+source: cropharvest
+
+# Where raw / processed data lives (ignored when source == "synthetic").
+data_dir: ${hydra:runtime.cwd}/data
+
+# Country filter for CropHarvest loader.
+country: Uzbekistan
+
+# Default AOI — Fergana Valley. WGS84 (lon_min, lat_min, lon_max, lat_max).
+# Used by the Sentinel-2 STAC downloader only. Override with --data.bbox=...
+bbox: [70.60, 40.10, 72.90, 41.40]
+
+# Date window for Sentinel-2 scene search.
+date_start: "2021-04-01"
+date_end: "2021-10-31"
+cloud_cover_max: 20
+
+# Multispectral bands to load (10m bands by default).
+bands: ["B02", "B03", "B04", "B08"]
+
+# Per-band normalization (approximate Sentinel-2 reflectance means / stds).
+# Applied after scaling DN values to [0, 1] via division by 10_000.
+mean: [0.1354, 0.1118, 0.1042, 0.3033]
+std:  [0.0605, 0.0621, 0.0754, 0.1082]
+
+# Image patch size fed to the model.
+image_size: 64
+
+# DataLoader settings.
+batch_size: 32
+num_workers: 4
+pin_memory: true
+
+# Train/val/test fractions (used when upstream data has no explicit split).
+val_split: 0.15
+test_split: 0.15
+
+# Class labels (order is meaningful: index -> name).
+# CropHarvest default is binary; override for multi-class crop-type work.
+classes:
+  - non_crop
+  - crop
