@@ -8,7 +8,7 @@ version = "0.1.0"
 description = "Train AI models for crop classification from Sentinel-2 imagery over Uzbekistan / Central Asia."
 readme = "README.md"
 license = { file = "LICENSE" }
-requires-python = ">=3.11"
+requires-python = ">=3.11,<3.14"
 authors = [{ name = "ai-train-on-gis-data contributors" }]
 keywords = ["geospatial", "gis", "remote-sensing", "sentinel-2", "crop-classification", "pytorch", "torchgeo"]
 classifiers = [
@@ -54,11 +54,6 @@ notebooks = [
     "folium>=0.15",
     "ipywidgets>=8.1",
 ]
-cropharvest = [
-    # Optional: full CropHarvest Python API. Only pulled in on demand
-    # because it has heavy transitive deps.
-    "cropharvest>=0.7",
-]
 
 [project.urls]
 Homepage = "https://github.com/bahromiddin-0256/ai-train-on-gis-data"
@@ -77,6 +72,9 @@ include = ["gis_train*"]
 
 [tool.setuptools.package-data]
 gis_train = ["py.typed"]
+
+[tool.uv]
+environments = ["sys_platform == 'linux'", "sys_platform == 'darwin'"]
 
 [tool.ruff]
 line-length = 100
