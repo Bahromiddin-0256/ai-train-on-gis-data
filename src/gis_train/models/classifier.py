@@ -28,20 +28,57 @@ from gis_train.utils.logging import get_logger
 _log = get_logger(__name__)
 
 
+# Sentinel-2 ALL-band order used by torchgeo SENTINEL2_ALL_MOCO weights.
+# Indices of our 4 working bands (B02, B03, B04, B08) within this ordering.
+_S2_ALL_BANDS = ["B01", "B02", "B03", "B04", "B05", "B06", "B07", "B08", "B08A", "B09", "B10", "B11", "B12"]
+_S2_WORKING_BAND_INDICES = [_S2_ALL_BANDS.index(b) for b in ["B02", "B03", "B04", "B08"]]
+
+
 def _build_backbone(name: str, in_channels: int, pretrained: bool) -> tuple[nn.Module, int]:
     """Return ``(backbone_without_classifier, feature_dim)``.
 
     Tries torchgeo first (for pretrained Sentinel-2 weights), then falls back
     to torchvision so the test suite works without the torchgeo data extras.
+
+    When ``pretrained=True`` and ``in_channels != 13``, loads the full 13-channel
+    SENTINEL2_ALL_MOCO backbone and replaces the first conv with a new layer whose
+    weights are initialized from the corresponding pretrained channels.  All 13
+    bands are: B01…B12 + B08A; our 4 bands (B02, B03, B04, B08) map to indices
+    [1, 2, 3, 7] in that ordering.
     """
     if name == "resnet50":
         try:
             from torchgeo.models import ResNet50_Weights, resnet50  # type: ignore[import-not-found]
 
-            weights = ResNet50_Weights.SENTINEL2_ALL_MOCO if pretrained else None
-            backbone = resnet50(weights=weights, in_chans=in_channels)
-            feature_dim = backbone.num_features  # timm-style attr on torchgeo resnets
-            backbone.reset_classifier(num_classes=0)
+            if pretrained:
+                # Load full 13-channel pretrained backbone, then slice first conv.
+                backbone = resnet50(weights=ResNet50_Weights.SENTINEL2_ALL_MOCO, in_chans=13)
+                feature_dim = backbone.num_features
+                backbone.reset_classifier(num_classes=0)
+
+                if in_channels != 13:
+                    old_conv = backbone.conv1
+                    new_conv = nn.Conv2d(
+                        in_channels,
+                        old_conv.out_channels,
+                        kernel_size=old_conv.kernel_size,
+                        stride=old_conv.stride,
+                        padding=old_conv.padding,
+                        bias=old_conv.bias is not None,
+                    )
+                    with torch.no_grad():
+                        indices = _S2_WORKING_BAND_INDICES[:in_channels]
+                        new_conv.weight.copy_(old_conv.weight[:, indices, :, :])
+                    backbone.conv1 = new_conv
+                    _log.info(
+                        "patched first conv: 13 → %d channels (band indices %s)",
+                        in_channels, indices,
+                    )
+            else:
+                backbone = resnet50(weights=None, in_chans=in_channels)
+                feature_dim = backbone.num_features
+                backbone.reset_classifier(num_classes=0)
+
             return backbone, feature_dim
         except (ImportError, AttributeError) as exc:
             _log.warning("torchgeo resnet50 unavailable (%s); falling back to torchvision", exc)
@@ -81,6 +118,8 @@ class CropClassifier(pl.LightningModule):
         in_channels: int = 4,
         num_classes: int = 2,
         pretrained: bool = True,
+        class_weights: list[float] | None = None,
+        label_smoothing: float = 0.0,
         optimizer: DictConfig | dict[str, Any] | None = None,
         scheduler: DictConfig | dict[str, Any] | None = None,
     ) -> None:
@@ -91,7 +130,9 @@ class CropClassifier(pl.LightningModule):
             name=backbone, in_channels=in_channels, pretrained=pretrained
         )
         self.head = nn.Linear(feature_dim, num_classes)
-        self.loss_fn = nn.CrossEntropyLoss()
+
+        weight = torch.tensor(class_weights, dtype=torch.float32) if class_weights else None
+        self.loss_fn = nn.CrossEntropyLoss(weight=weight, label_smoothing=label_smoothing)
 
         self._optimizer_cfg = optimizer
         self._scheduler_cfg = scheduler

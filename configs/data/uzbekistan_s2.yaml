@@ -8,6 +8,9 @@ _target_: gis_train.data.datamodule.CropDataModule
 # One of: "cropharvest", "synthetic", "local"
 source: local
 
+# Number of samples to generate when source == "synthetic" (ignored otherwise).
+synthetic_n: 128
+
 # Where raw / processed data lives (ignored when source == "synthetic").
 data_dir: ${hydra:runtime.cwd}/data
 

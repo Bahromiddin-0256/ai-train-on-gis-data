@@ -17,7 +17,15 @@ num_classes: 3
 
 # Load torchgeo's Sentinel-2 MoCo pretrained weights for the backbone.
 # Set to false for from-scratch training.
-pretrained: false
+pretrained: true
+
+# Per-class loss weights to counter class imbalance.
+# Set to null to use unweighted CrossEntropyLoss.
+# Example: [1.0, 2.5, 1.5] for [bugdoy, other, paxta]
+class_weights: null
+
+# Label smoothing regularization (0.0 = off, 0.1 = recommended).
+label_smoothing: 0.1
 
 # Optimizer.
 optimizer:

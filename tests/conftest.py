@@ -65,6 +65,7 @@ def tiny_config_overrides() -> list[str]:
     return [
         "data.source=synthetic",
         "data.synthetic_n=32",
+        "data.data_dir=.",
         "data.image_size=16",
         "data.batch_size=4",
         "data.num_workers=0",
@@ -78,7 +79,6 @@ def tiny_config_overrides() -> list[str]:
         "trainer.devices=1",
         "trainer.enable_progress_bar=false",
         "trainer.log_every_n_steps=1",
-        "trainer.enable_checkpointing=false",
     ]
 
 

@@ -72,6 +72,46 @@ class RandomVFlip:
         return x
 
 
+class RandomRotation90:
+    """Randomly rotate by a multiple of 90° (0, 90, 180, or 270 degrees).
+
+    Appropriate for GIS imagery where objects have no preferred orientation.
+    """
+
+    def __call__(self, x: torch.Tensor) -> torch.Tensor:
+        k = int(torch.randint(4, ()).item())
+        return torch.rot90(x, k=k, dims=[-2, -1])
+
+
+class SpectralJitter:
+    """Per-band brightness and contrast jitter for spectral robustness.
+
+    Simulates sensor calibration drift and seasonal reflectance variation
+    common in multi-temporal Sentinel-2 data.
+    """
+
+    def __init__(self, brightness: float = 0.1, contrast: float = 0.1) -> None:
+        self._brightness = brightness
+        self._contrast = contrast
+
+    def __call__(self, x: torch.Tensor) -> torch.Tensor:
+        c = x.shape[0]
+        # Independent scale (contrast) and shift (brightness) per band.
+        scale = 1.0 + (torch.rand(c, 1, 1) * 2 - 1) * self._contrast
+        shift = (torch.rand(c, 1, 1) * 2 - 1) * self._brightness
+        return x * scale.to(x.device, x.dtype) + shift.to(x.device, x.dtype)
+
+
+class GaussianNoise:
+    """Add channel-wise Gaussian noise to simulate sensor noise."""
+
+    def __init__(self, std: float = 0.01) -> None:
+        self._std = std
+
+    def __call__(self, x: torch.Tensor) -> torch.Tensor:
+        return x + torch.randn_like(x) * self._std
+
+
 class Compose:
     """Sequentially apply a list of transforms."""
 
@@ -96,6 +136,9 @@ def build_train_transforms(
             Normalize(mean=mean, std=std),
             RandomHFlip(p=0.5),
             RandomVFlip(p=0.5),
+            RandomRotation90(),
+            SpectralJitter(brightness=0.1, contrast=0.1),
+            GaussianNoise(std=0.01),
         ]
     )
 
