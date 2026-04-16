@@ -11,6 +11,10 @@ source: local
 # Where raw / processed data lives (ignored when source == "synthetic").
 data_dir: ${hydra:runtime.cwd}/data
 
+# Optional external test set directory (images.npy + labels.npy).
+# If set, this is used as the test split instead of a random split from data_dir.
+external_test_dir: null
+
 # Country filter for CropHarvest loader.
 country: Uzbekistan
 
@@ -26,10 +30,10 @@ cloud_cover_max: 20
 # Multispectral bands to load (10m bands by default).
 bands: ["B02", "B03", "B04", "B08"]
 
-# Per-band normalization (approximate Sentinel-2 reflectance means / stds).
+# Per-band normalization — computed from data/processed_full (44 023 chips).
 # Applied after scaling DN values to [0, 1] via division by 10_000.
-mean: [0.1354, 0.1118, 0.1042, 0.3033]
-std:  [0.0605, 0.0621, 0.0754, 0.1082]
+mean: [0.1737, 0.2178, 0.2261, 0.4629]
+std:  [0.0451, 0.0536, 0.0838, 0.0701]
 
 # Image patch size fed to the model.
 image_size: 64

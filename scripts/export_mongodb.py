@@ -117,6 +117,19 @@ def _wkt_to_geojson_geom(wkt_str: str) -> dict:
     show_default=True,
     help="Filter by tuman_code integer (0 = no filter).",
 )
+@click.option(
+    "--exclude-tuman-code",
+    default="",
+    show_default=True,
+    help="Comma-separated tuman_code values to exclude (e.g. 1708215,1707210).",
+)
+@click.option(
+    "--per-class",
+    default=0,
+    type=int,
+    show_default=True,
+    help="Randomly sample this many polygons per class (0 = no limit, use --limit instead).",
+)
 def main(
     uri: str,
     db: str,
@@ -128,6 +141,8 @@ def main(
     viloyat: str,
     tuman: str,
     tuman_code: int,
+    exclude_tuman_code: str,
+    per_class: int,
 ) -> None:
     """Export MongoDB crop polygons to a GeoJSON FeatureCollection."""
     try:
@@ -147,6 +162,9 @@ def main(
         query["tuman"] = {"$regex": tuman, "$options": "i"}
     if tuman_code:
         query["tuman_code"] = tuman_code
+    if exclude_tuman_code:
+        codes = [int(c.strip()) for c in exclude_tuman_code.split(",") if c.strip()]
+        query["tuman_code"] = {"$nin": codes}
 
     projection = {geom_field: 1, label_field: 1, "_id": 0}
     cursor = col.find(query, projection)
@@ -186,6 +204,23 @@ def main(
         )
 
     _log.info("exported %d features, skipped %d", len(features), skipped)
+
+    # --- per-class random sampling -----------------------------------------
+    if per_class > 0:
+        import random
+        from collections import defaultdict
+
+        by_class: dict[str, list[dict]] = defaultdict(list)
+        for f in features:
+            by_class[f["properties"][label_field]].append(f)
+
+        sampled: list[dict] = []
+        for cls, items in sorted(by_class.items()):
+            chosen = random.sample(items, min(per_class, len(items)))
+            sampled.extend(chosen)
+            _log.info("class %r: sampled %d / %d", cls, len(chosen), len(items))
+        features = sampled
+        _log.info("total after per-class sampling: %d", len(features))
 
     out.parent.mkdir(parents=True, exist_ok=True)
     geojson = {"type": "FeatureCollection", "features": features}

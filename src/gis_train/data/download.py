@@ -163,6 +163,194 @@ def _clip_tif_to_bbox(src_path: Path, dst_path: Path, bbox: BBox) -> None:
     )
 
 
+def fetch_chips_from_stac(
+    gdf,
+    bands: Sequence[str],
+    date_start: str,
+    date_end: str,
+    chip_size: int = 64,
+    cloud_cover_max: float = 20.0,
+    min_native_px: int = 4,
+) -> tuple[list, list[int]]:
+    """Read per-polygon chips directly from Planetary Computer COGs (no tile download).
+
+    Scene-first approach — O(scenes) STAC queries instead of O(polygons):
+      1. One STAC query covering the full bbox of all polygons.
+      2. Each polygon is assigned to the least-cloudy scene that covers it.
+      3. Polygons are grouped by scene; each COG band file is opened once per scene.
+      4. All polygon windows are extracted in a single pass per scene.
+
+    Returns ``(chips, labels)`` where chips is a list of ``np.ndarray`` and
+    labels is a list of int class indices.
+
+    Parameters
+    ----------
+    gdf:
+        GeoDataFrame in EPSG:4326.  Must have a ``class_idx`` integer column.
+    """
+    from collections import defaultdict
+
+    import numpy as np
+    import planetary_computer  # type: ignore[import-not-found]
+    import torch
+    import torch.nn.functional as F
+    from pyproj import Transformer
+    from pystac_client import Client  # type: ignore[import-not-found]
+    from rasterio.windows import from_bounds
+    from tqdm import tqdm
+
+    import rasterio
+
+    catalog = Client.open(_PC_STAC_URL)
+
+    # ------------------------------------------------------------------
+    # Step 1: single STAC query covering all polygons
+    # ------------------------------------------------------------------
+    total_bounds = tuple(float(x) for x in gdf.total_bounds)  # (minx, miny, maxx, maxy)
+    _log.info(
+        "Querying STAC: bbox=(%.4f,%.4f,%.4f,%.4f) %s..%s",
+        *total_bounds, date_start, date_end,
+    )
+    all_items = list(
+        catalog.search(
+            collections=[_S2_L2A_COLLECTION],
+            bbox=total_bounds,
+            datetime=f"{date_start}/{date_end}",
+            query={"eo:cloud_cover": {"lt": cloud_cover_max}},
+            sortby=[{"field": "eo:cloud_cover", "direction": "asc"}],
+        ).items()
+    )
+    _log.info("Found %d candidate scenes", len(all_items))
+
+    if not all_items:
+        _log.warning("No scenes found — check date range and cloud_cover_max")
+        return [], []
+
+    # ------------------------------------------------------------------
+    # Step 2: build scene bbox index (WGS-84)
+    # sorted ascending by cloud cover so first match = least cloudy
+    # ------------------------------------------------------------------
+    scene_infos: list[tuple[str, tuple, object]] = []  # (id, bbox_wgs84, item)
+    for item in all_items:
+        geom = item.geometry
+        if geom and geom.get("type") == "Polygon":
+            coords = geom["coordinates"][0]
+            xs = [c[0] for c in coords]
+            ys = [c[1] for c in coords]
+            sbbox = (min(xs), min(ys), max(xs), max(ys))
+        elif item.bbox:
+            sbbox = tuple(item.bbox)
+        else:
+            continue
+        scene_infos.append((item.id, sbbox, item))
+
+    # ------------------------------------------------------------------
+    # Step 3: assign each polygon → best (least cloudy) covering scene
+    # ------------------------------------------------------------------
+    poly_to_scene: dict[int, str] = {}
+    scene_items: dict[str, object] = {}
+
+    for idx, row in gdf.iterrows():
+        geom = row.geometry
+        if geom is None or geom.is_empty:
+            continue
+        pb = geom.bounds
+        for scene_id, sbbox, item in scene_infos:
+            if pb[0] <= sbbox[2] and pb[2] >= sbbox[0] and pb[1] <= sbbox[3] and pb[3] >= sbbox[1]:
+                poly_to_scene[idx] = scene_id
+                scene_items[scene_id] = item
+                break
+
+    skipped_no_scene = len(gdf) - len(poly_to_scene)
+    _log.info(
+        "Assigned %d/%d polygons across %d scenes (%d unassigned)",
+        len(poly_to_scene), len(gdf), len(scene_items), skipped_no_scene,
+    )
+
+    scene_to_polys: dict[str, list[int]] = defaultdict(list)
+    for idx, scene_id in poly_to_scene.items():
+        scene_to_polys[scene_id].append(idx)
+
+    # ------------------------------------------------------------------
+    # Step 4: per-scene windowed reads — open each COG once
+    # ------------------------------------------------------------------
+    def _read_window_from_src(src, geom) -> np.ndarray | None:
+        nb = src.bounds
+        if src.crs.to_epsg() == 4326:
+            bx0, by0, bx1, by1 = geom.bounds
+        else:
+            t = Transformer.from_crs("EPSG:4326", src.crs, always_xy=True)
+            b = geom.bounds
+            corners = [
+                t.transform(b[0], b[1]), t.transform(b[2], b[1]),
+                t.transform(b[0], b[3]), t.transform(b[2], b[3]),
+            ]
+            xs, ys = zip(*corners)
+            bx0, bx1 = min(xs), max(xs)
+            by0, by1 = min(ys), max(ys)
+        bx0 = max(bx0, nb.left);  by0 = max(by0, nb.bottom)
+        bx1 = min(bx1, nb.right); by1 = min(by1, nb.top)
+        if bx0 >= bx1 or by0 >= by1:
+            return None
+        win = from_bounds(bx0, by0, bx1, by1, src.transform)
+        return src.read(window=win)
+
+    chips: list[np.ndarray] = []
+    labels: list[int] = []
+    skipped_small = 0
+
+    for scene_id, poly_indices in tqdm(
+        scene_to_polys.items(), desc="scenes", unit="scene"
+    ):
+        item = scene_items[scene_id]
+        signed = planetary_computer.sign(item)
+        hrefs = {b: signed.assets[b].href for b in bands if b in signed.assets}
+        if len(hrefs) < len(bands):
+            continue
+
+        # Open all band COGs for this scene at once
+        try:
+            band_srcs = [rasterio.open(hrefs[b]) for b in bands]
+        except Exception as exc:
+            _log.warning("Cannot open scene %s: %s", scene_id, exc)
+            continue
+
+        try:
+            for idx in tqdm(poly_indices, desc=f"  {scene_id[:28]}", unit="poly", leave=False):
+                row = gdf.loc[idx]
+                geom = row.geometry
+
+                band_arrays: list[np.ndarray] = []
+                ok = True
+                for src in band_srcs:
+                    arr = _read_window_from_src(src, geom)
+                    if arr is None or arr.shape[1] < min_native_px or arr.shape[2] < min_native_px:
+                        ok = False
+                        skipped_small += 1
+                        break
+                    band_arrays.append(arr)
+
+                if not ok:
+                    continue
+
+                stacked = np.concatenate(band_arrays, axis=0).astype(np.float32)
+                t = torch.from_numpy(stacked).unsqueeze(0)
+                resized = F.interpolate(
+                    t, size=(chip_size, chip_size), mode="bilinear", align_corners=False
+                )
+                chips.append(resized.squeeze(0).numpy())
+                labels.append(int(row["class_idx"]))
+        finally:
+            for src in band_srcs:
+                src.close()
+
+    _log.info(
+        "Done: %d chips (skipped %d no-scene, %d too-small)",
+        len(chips), skipped_no_scene, skipped_small,
+    )
+    return chips, labels
+
+
 def download_sentinel2_l2a(
     bbox: BBox,
     date_start: str,

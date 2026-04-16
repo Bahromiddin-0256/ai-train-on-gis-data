@@ -168,9 +168,10 @@ def _extract_chip(
 @click.command()
 @click.option(
     "--tiles-dir",
-    type=click.Path(exists=True, file_okay=False, path_type=Path),
-    required=True,
-    help="Directory with Sentinel-2 GeoTIFF tiles (output of `download_data.py`).",
+    type=click.Path(file_okay=False, path_type=Path),
+    default=None,
+    help="Directory with downloaded Sentinel-2 GeoTIFF tiles. "
+         "Required unless --from-stac is set.",
 )
 @click.option(
     "--vectors",
@@ -206,27 +207,58 @@ def _extract_chip(
     show_default=True,
     help="Destination for images.npy + labels.npy.",
 )
+@click.option(
+    "--from-stac",
+    is_flag=True,
+    default=False,
+    help="Read chips directly from Planetary Computer COGs — no tile download needed.",
+)
+@click.option(
+    "--date-start",
+    type=str,
+    default="2025-06-01",
+    show_default=True,
+    help="Start date for STAC search (used only with --from-stac).",
+)
+@click.option(
+    "--date-end",
+    type=str,
+    default="2025-08-31",
+    show_default=True,
+    help="End date for STAC search (used only with --from-stac).",
+)
+@click.option(
+    "--bands",
+    type=str,
+    default="B02,B03,B04,B08",
+    show_default=True,
+    help="Comma-separated band IDs (used only with --from-stac).",
+)
 def main(
-    tiles_dir: Path,
+    tiles_dir: Path | None,
     vectors: Path,
     class_field: str,
     chip_size: int,
     min_pixels: int,
     out: Path,
+    from_stac: bool,
+    date_start: str,
+    date_end: str,
+    bands: str,
 ) -> None:
-    """Produce images.npy + labels.npy using polygon-level chips (one chip per field)."""
+    """Produce images.npy + labels.npy using polygon-level chips (one chip per field).
+
+    Two modes:
+
+    \b
+    1. Local tiles (default):
+         --tiles-dir data/raw/s2_zarbdor --vectors data/labels/zarbdor.geojson
+
+    \b
+    2. Direct STAC read (no download):
+         --from-stac --vectors data/labels/val_random.geojson
+    """
     import geopandas as gpd
-    from tqdm import tqdm
-
-    # --- load tiles and build scene index -----------------------------------
-    tiles = sorted(tiles_dir.glob("*.tif"))
-    if not tiles:
-        raise click.UsageError(f"no .tif files found in {tiles_dir}")
-    _log.info("found %d tile files", len(tiles))
-
-    scene_groups = _group_tiles_by_scene(tiles)
-    _log.info("grouped into %d scenes", len(scene_groups))
-    scene_index = _build_scene_index(scene_groups)
 
     # --- load vector labels -------------------------------------------------
     gdf = gpd.read_file(vectors).to_crs("EPSG:4326")
@@ -237,67 +269,112 @@ def main(
     class_to_idx = {name: i for i, name in enumerate(classes)}
     _log.info("classes: %s", class_to_idx)
 
-    # --- extract one chip per polygon ---------------------------------------
-    images: list[np.ndarray] = []
-    labels: list[int] = []
-    skipped_no_scene = 0
-    skipped_small = 0
-    skipped_label = 0
+    # -----------------------------------------------------------------------
+    # Mode A: read directly from Planetary Computer STAC
+    # -----------------------------------------------------------------------
+    if from_stac:
+        from gis_train.data.download import fetch_chips_from_stac
 
-    for _, row in tqdm(gdf.iterrows(), total=len(gdf), desc="extracting chips", unit="poly"):
-        geom = row.geometry
-        label_str = row.get(class_field)
+        band_list = [b.strip() for b in bands.split(",") if b.strip()]
+        gdf["class_idx"] = gdf[class_field].map(class_to_idx)
+        gdf = gdf[gdf["class_idx"].notna()].copy()
 
-        if geom is None or geom.is_empty:
-            skipped_label += 1
-            continue
-        if label_str not in class_to_idx:
-            skipped_label += 1
-            continue
+        chips, label_list = fetch_chips_from_stac(
+            gdf=gdf,
+            bands=band_list,
+            date_start=date_start,
+            date_end=date_end,
+            chip_size=chip_size,
+            min_native_px=min_pixels,
+        )
 
-        gb = geom.bounds  # WGS-84
+        if not chips:
+            raise RuntimeError("no chips produced — check vectors and date range")
 
-        chip = None
-        for scene in scene_index:
-            sb = scene["bounds_wgs84"]
-            # Quick AABB overlap check
-            if gb[2] < sb[0] or gb[0] > sb[2] or gb[3] < sb[1] or gb[1] > sb[3]:
+        images_arr = np.stack(chips).astype(np.float32)
+        labels_arr = np.asarray(label_list, dtype=np.int64)
+
+    # -----------------------------------------------------------------------
+    # Mode B: read from pre-downloaded local tiles
+    # -----------------------------------------------------------------------
+    else:
+        from tqdm import tqdm
+
+        if tiles_dir is None:
+            raise click.UsageError("--tiles-dir is required unless --from-stac is set")
+        if not tiles_dir.exists():
+            raise click.UsageError(f"tiles-dir does not exist: {tiles_dir}")
+
+        tiles = sorted(tiles_dir.glob("*.tif"))
+        if not tiles:
+            raise click.UsageError(f"no .tif files found in {tiles_dir}")
+        _log.info("found %d tile files", len(tiles))
+
+        scene_groups = _group_tiles_by_scene(tiles)
+        _log.info("grouped into %d scenes", len(scene_groups))
+        scene_index = _build_scene_index(scene_groups)
+
+        images: list[np.ndarray] = []
+        labels: list[int] = []
+        skipped_no_scene = 0
+        skipped_small = 0
+        skipped_label = 0
+
+        for _, row in tqdm(gdf.iterrows(), total=len(gdf), desc="extracting chips", unit="poly"):
+            geom = row.geometry
+            label_str = row.get(class_field)
+
+            if geom is None or geom.is_empty:
+                skipped_label += 1
                 continue
-            chip = _extract_chip(scene, geom, chip_size=chip_size, min_native_px=min_pixels)
-            if chip is not None:
-                break
+            if label_str not in class_to_idx:
+                skipped_label += 1
+                continue
 
-        if chip is None:
-            # Distinguish "no scene" from "too small"
-            covered = any(
-                not (gb[2] < s["bounds_wgs84"][0] or gb[0] > s["bounds_wgs84"][2]
-                     or gb[3] < s["bounds_wgs84"][1] or gb[1] > s["bounds_wgs84"][3])
-                for s in scene_index
-            )
-            if covered:
-                skipped_small += 1
-            else:
-                skipped_no_scene += 1
-            continue
+            gb = geom.bounds
+            chip = None
+            for scene in scene_index:
+                sb = scene["bounds_wgs84"]
+                if gb[2] < sb[0] or gb[0] > sb[2] or gb[3] < sb[1] or gb[1] > sb[3]:
+                    continue
+                chip = _extract_chip(scene, geom, chip_size=chip_size, min_native_px=min_pixels)
+                if chip is not None:
+                    break
 
-        images.append(chip)
-        labels.append(class_to_idx[label_str])
+            if chip is None:
+                covered = any(
+                    not (gb[2] < s["bounds_wgs84"][0] or gb[0] > s["bounds_wgs84"][2]
+                         or gb[3] < s["bounds_wgs84"][1] or gb[1] > s["bounds_wgs84"][3])
+                    for s in scene_index
+                )
+                if covered:
+                    skipped_small += 1
+                else:
+                    skipped_no_scene += 1
+                continue
 
-    if not images:
-        raise RuntimeError("no chips produced — check tiles-dir and vectors overlap")
+            images.append(chip)
+            labels.append(class_to_idx[label_str])
 
-    images_arr = np.stack(images).astype(np.float32)   # (N, C, chip_size, chip_size)
-    labels_arr = np.asarray(labels, dtype=np.int64)     # (N,)
+        if not images:
+            raise RuntimeError("no chips produced — check tiles-dir and vectors overlap")
 
+        images_arr = np.stack(images).astype(np.float32)
+        labels_arr = np.asarray(labels, dtype=np.int64)
+
+        click.echo(f"  skipped : {skipped_no_scene} (no scene), "
+                   f"{skipped_small} (too small), {skipped_label} (no label)")
+
+    # -----------------------------------------------------------------------
+    # Save
+    # -----------------------------------------------------------------------
     out.mkdir(parents=True, exist_ok=True)
     np.save(out / "images.npy", images_arr)
     np.save(out / "labels.npy", labels_arr)
 
     click.echo(f"\nwrote {len(images_arr)} chips → {out}/")
     click.echo(f"  shape   : {images_arr.shape}")
-    click.echo(f"  skipped : {skipped_no_scene} (no scene), "
-               f"{skipped_small} (too small), {skipped_label} (no label)")
-    click.echo(f"\nClass distribution:")
+    click.echo("\nClass distribution:")
     from collections import Counter
     counts = Counter(labels_arr.tolist())
     for idx, n in sorted(counts.items()):

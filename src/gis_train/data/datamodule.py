@@ -75,6 +75,7 @@ class CropDataModule(pl.LightningDataModule):
         self,
         source: str = "synthetic",
         data_dir: str | Path = "./data",
+        external_test_dir: str | Path | None = None,
         country: str = "Uzbekistan",
         bbox: Sequence[float] = (70.60, 40.10, 72.90, 41.40),
         date_start: str = "2021-04-01",
@@ -100,6 +101,7 @@ class CropDataModule(pl.LightningDataModule):
 
         self.source = source
         self.data_dir = Path(data_dir)
+        self.external_test_dir = Path(external_test_dir) if external_test_dir else None
         self.country = country
         self.bbox = tuple(bbox)
         self.date_start = date_start
@@ -154,35 +156,61 @@ class CropDataModule(pl.LightningDataModule):
                 "configured — check `data.bands`"
             )
 
-        rng = np.random.default_rng(self.seed)
-        train_idx, val_idx, test_idx = _make_splits(
-            n=images.shape[0],
-            val_split=self.val_split,
-            test_split=self.test_split,
-            rng=rng,
-        )
-
         train_tf = build_train_transforms(mean=self.mean, std=self.std)
         eval_tf = build_val_transforms(mean=self.mean, std=self.std)
 
-        full_train = CropClassificationDataset.from_arrays(
-            images=images, labels=labels, transform=train_tf, num_classes=self.num_classes
-        )
-        full_eval = CropClassificationDataset.from_arrays(
-            images=images, labels=labels, transform=eval_tf, num_classes=self.num_classes
-        )
+        if self.external_test_dir is not None:
+            # External test set: use all of data_dir for train+val, external for test
+            ext_images = np.load(self.external_test_dir / "images.npy")
+            ext_labels = np.load(self.external_test_dir / "labels.npy")
 
-        self._train = Subset(full_train, train_idx.tolist())
-        self._val = Subset(full_eval, val_idx.tolist())
-        self._test = Subset(full_eval, test_idx.tolist())
+            rng = np.random.default_rng(self.seed)
+            n = images.shape[0]
+            n_val = round(n * self.val_split)
+            indices = rng.permutation(n)
+            val_idx = indices[:n_val]
+            train_idx = indices[n_val:]
 
-        _log.info(
-            "prepared splits: train=%d val=%d test=%d (source=%s)",
-            len(self._train),
-            len(self._val),
-            len(self._test),
-            self.source,
-        )
+            full_train = CropClassificationDataset.from_arrays(
+                images=images, labels=labels, transform=train_tf, num_classes=self.num_classes
+            )
+            full_eval = CropClassificationDataset.from_arrays(
+                images=images, labels=labels, transform=eval_tf, num_classes=self.num_classes
+            )
+            self._train = Subset(full_train, train_idx.tolist())
+            self._val = Subset(full_eval, val_idx.tolist())
+            self._test = CropClassificationDataset.from_arrays(
+                images=ext_images, labels=ext_labels, transform=eval_tf,
+                num_classes=self.num_classes,
+            )
+            _log.info(
+                "prepared splits: train=%d val=%d test=%d (external, source=%s)",
+                len(self._train), len(self._val), len(self._test), self.source,
+            )
+        else:
+            rng = np.random.default_rng(self.seed)
+            train_idx, val_idx, test_idx = _make_splits(
+                n=images.shape[0],
+                val_split=self.val_split,
+                test_split=self.test_split,
+                rng=rng,
+            )
+
+            full_train = CropClassificationDataset.from_arrays(
+                images=images, labels=labels, transform=train_tf, num_classes=self.num_classes
+            )
+            full_eval = CropClassificationDataset.from_arrays(
+                images=images, labels=labels, transform=eval_tf, num_classes=self.num_classes
+            )
+
+            self._train = Subset(full_train, train_idx.tolist())
+            self._val = Subset(full_eval, val_idx.tolist())
+            self._test = Subset(full_eval, test_idx.tolist())
+
+            _log.info(
+                "prepared splits: train=%d val=%d test=%d (source=%s)",
+                len(self._train), len(self._val), len(self._test), self.source,
+            )
 
     # ------------------------------------------------------------------
     # DataLoader factories
