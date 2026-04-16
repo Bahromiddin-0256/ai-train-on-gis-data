@@ -78,6 +78,18 @@ def _parse_bbox(value: str) -> BBox:
     show_default=True,
     help="Output directory for downloaded GeoTIFFs.",
 )
+@click.option(
+    "--no-clip",
+    is_flag=True,
+    default=False,
+    help="Disable bbox clipping (download full 110×110 km tiles).",
+)
+@click.option(
+    "--dry-run",
+    is_flag=True,
+    default=False,
+    help="Only count scenes and files — do not download anything.",
+)
 def main(
     aoi: str,
     bbox: str | None,
@@ -87,13 +99,37 @@ def main(
     cloud_cover_max: float,
     limit: int | None,
     out: Path,
+    no_clip: bool,
+    dry_run: bool,
 ) -> None:
     """Download Sentinel-2 L2A imagery for the given AOI + time window."""
     bbox_obj = _parse_bbox(bbox) if bbox else _AOI_PRESETS[aoi]
     band_list = [b.strip() for b in bands.split(",") if b.strip()]
     _log.info(
-        "AOI=%s bbox=%s bands=%s", aoi if not bbox else "custom", bbox_obj.as_tuple(), band_list
+        "AOI=%s bbox=%s bands=%s clip=%s",
+        aoi if not bbox else "custom",
+        bbox_obj.as_tuple(),
+        band_list,
+        not no_clip,
     )
+
+    if dry_run:
+        from gis_train.data.download import search_sentinel2_l2a
+        items = list(search_sentinel2_l2a(
+            bbox=bbox_obj,
+            date_start=date_start,
+            date_end=date_end,
+            cloud_cover_max=cloud_cover_max,
+            limit=limit,
+        ))
+        n_files = len(items) * len(band_list)
+        click.echo(f"\nDry run — nothing downloaded.")
+        click.echo(f"  Scenes : {len(items)}")
+        click.echo(f"  Bands  : {len(band_list)}  {band_list}")
+        click.echo(f"  Files  : {n_files}")
+        click.echo(f"  Dates  : {items[-1].datetime.date() if items else '—'}"
+                   f" → {items[0].datetime.date() if items else '—'}")
+        return
 
     result = download_sentinel2_l2a(
         bbox=bbox_obj,
@@ -103,6 +139,7 @@ def main(
         bands=band_list,
         cloud_cover_max=cloud_cover_max,
         limit=limit,
+        clip=not no_clip,
     )
     click.echo(
         f"Downloaded {result.assets} assets across {result.scenes} scenes -> {result.out_dir}"
