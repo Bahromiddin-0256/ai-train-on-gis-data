@@ -23,9 +23,9 @@ CKPT_PATH = os.path.join(
     os.path.dirname(__file__),
     "..",
     "lightning_logs",
-    "version_8",
+    "version_13",
     "checkpoints",
-    "epoch=49-step=48150.ckpt",
+    "best-epoch=18-val_f1=0.0000.ckpt",
 )
 OUT_PATH = os.path.join(
     os.path.dirname(__file__),
