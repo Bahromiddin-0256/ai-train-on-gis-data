@@ -172,17 +172,20 @@ def download_sentinel2_l2a(
     cloud_cover_max: float = 20.0,
     limit: int | None = None,
     clip: bool = True,
+    max_workers: int = 4,
 ) -> DownloadResult:
     """Download the requested Sentinel-2 L2A band assets into ``out_dir``.
 
+    Downloads up to *max_workers* files in parallel using threads.
     When *clip* is ``True`` (default) each tile is cropped to *bbox* after
-    download, which can reduce file size by 10–50× for small AOIs.  The full
-    tile is downloaded to a ``.tmp`` file first, then clipped; the ``.tmp`` is
-    removed afterwards regardless of success.
+    download, reducing file size by 10–50× for small AOIs.
 
     Returns a :class:`DownloadResult` with the number of scenes / assets
     written. Each asset is saved as ``{scene_id}_{band}.tif``.
     """
+    import threading
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
     try:
         import planetary_computer  # type: ignore[import-not-found]
         import requests  # noqa: F401 — checked here so error is early
@@ -208,42 +211,66 @@ def download_sentinel2_l2a(
     )
     n_scenes = len(all_items)
     n_files = n_scenes * len(bands)
-    already = sum(1 for item in all_items for band in bands
-                  if (out / f"{item.id}_{band}.tif").exists())
+    already = sum(
+        1 for item in all_items for band in bands
+        if (out / f"{item.id}_{band}.tif").exists()
+    )
     _log.info(
         "Found %d scenes × %d bands = %d files  (already downloaded: %d, remaining: %d)",
         n_scenes, len(bands), n_files, already, n_files - already,
     )
 
-    scenes = 0
-    assets = 0
-    scene_bar = tqdm(all_items, total=n_scenes, desc="scenes", unit="scene", dynamic_ncols=True)
-    for item in scene_bar:
-        scenes += 1
-        scene_bar.set_postfix(scene=item.id[:30])
+    # Build a flat list of (dest, url) for every file that needs downloading.
+    tasks: list[tuple[Path, str, str]] = []  # (dest, url, band)
+    for item in all_items:
         signed = planetary_computer.sign(item)
         for band in bands:
+            dest = out / f"{item.id}_{band}.tif"
+            if dest.exists():
+                continue
             asset = signed.assets.get(band)
             if asset is None:
                 _log.warning("scene %s missing band %s; skipping", item.id, band)
                 continue
-            dest = out / f"{item.id}_{band}.tif"
-            tmp = dest.with_suffix(".tmp")
-            if dest.exists():
-                _log.debug("already have %s; skipping", dest.name)
-                assets += 1
-                continue
-            # Remove any leftover partial download before starting fresh.
-            tmp.unlink(missing_ok=True)
-            try:
-                _download_with_retry(asset.href, tmp, band=band, retries=5, backoff=3.0)
-                if clip:
-                    _clip_tif_to_bbox(tmp, dest, bbox)
-                else:
-                    tmp.rename(dest)
-            finally:
-                tmp.unlink(missing_ok=True)
-            assets += 1
+            tasks.append((dest, asset.href, band))
 
-    _log.info("downloaded %d assets across %d scenes into %s", assets, scenes, out)
-    return DownloadResult(out_dir=out, scenes=scenes, assets=assets)
+    assets_lock = threading.Lock()
+    completed_assets = already
+
+    def _fetch(dest: Path, url: str, band: str) -> bool:
+        tmp = dest.with_suffix(".tmp")
+        tmp.unlink(missing_ok=True)
+        try:
+            _download_with_retry(url, tmp, band=band, retries=5, backoff=3.0)
+            if clip:
+                _clip_tif_to_bbox(tmp, dest, bbox)
+            else:
+                tmp.rename(dest)
+            return True
+        finally:
+            tmp.unlink(missing_ok=True)
+
+    progress = tqdm(
+        total=n_files,
+        initial=already,
+        desc="files",
+        unit="file",
+        dynamic_ncols=True,
+    )
+
+    with ThreadPoolExecutor(max_workers=max_workers) as pool:
+        futures = {pool.submit(_fetch, dest, url, band): dest for dest, url, band in tasks}
+        for future in as_completed(futures):
+            dest = futures[future]
+            try:
+                future.result()
+            except Exception as exc:
+                _log.error("failed to download %s: %s", dest.name, exc)
+            with assets_lock:
+                completed_assets += 1
+            progress.update(1)
+            progress.set_postfix(file=dest.name[:40])
+
+    progress.close()
+    _log.info("downloaded %d assets across %d scenes into %s", completed_assets, n_scenes, out)
+    return DownloadResult(out_dir=out, scenes=n_scenes, assets=completed_assets)

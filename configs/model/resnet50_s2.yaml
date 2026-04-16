@@ -3,6 +3,7 @@
 # The classifier head is replaced with a fresh Linear(num_classes) layer.
 
 _target_: gis_train.models.classifier.CropClassifier
+_recursive_: false
 
 # Backbone architecture — "resnet50" | "resnet18" | "resnet50_random".
 # "resnet50" loads Sentinel-2 MoCo pretrained weights from torchgeo.
@@ -12,11 +13,11 @@ backbone: resnet50
 in_channels: 4
 
 # Number of output classes (must match len(data.classes)).
-num_classes: 2
+num_classes: 3
 
 # Load torchgeo's Sentinel-2 MoCo pretrained weights for the backbone.
 # Set to false for from-scratch training.
-pretrained: true
+pretrained: false
 
 # Optimizer.
 optimizer:

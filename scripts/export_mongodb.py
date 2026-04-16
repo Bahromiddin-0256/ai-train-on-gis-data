@@ -108,7 +108,14 @@ def _wkt_to_geojson_geom(wkt_str: str) -> dict:
     "--tuman",
     default="",
     show_default=True,
-    help="Filter to a single tuman (empty = all).",
+    help="Filter to a single tuman by name (empty = all).",
+)
+@click.option(
+    "--tuman-code",
+    default=0,
+    type=int,
+    show_default=True,
+    help="Filter by tuman_code integer (0 = no filter).",
 )
 def main(
     uri: str,
@@ -120,6 +127,7 @@ def main(
     limit: int,
     viloyat: str,
     tuman: str,
+    tuman_code: int,
 ) -> None:
     """Export MongoDB crop polygons to a GeoJSON FeatureCollection."""
     try:
@@ -137,6 +145,8 @@ def main(
         query["viloyat"] = {"$regex": viloyat, "$options": "i"}
     if tuman:
         query["tuman"] = {"$regex": tuman, "$options": "i"}
+    if tuman_code:
+        query["tuman_code"] = tuman_code
 
     projection = {geom_field: 1, label_field: 1, "_id": 0}
     cursor = col.find(query, projection)

@@ -85,6 +85,13 @@ def _parse_bbox(value: str) -> BBox:
     help="Disable bbox clipping (download full 110×110 km tiles).",
 )
 @click.option(
+    "--workers",
+    type=int,
+    default=4,
+    show_default=True,
+    help="Number of parallel download threads.",
+)
+@click.option(
     "--dry-run",
     is_flag=True,
     default=False,
@@ -101,6 +108,7 @@ def main(
     out: Path,
     no_clip: bool,
     dry_run: bool,
+    workers: int,
 ) -> None:
     """Download Sentinel-2 L2A imagery for the given AOI + time window."""
     bbox_obj = _parse_bbox(bbox) if bbox else _AOI_PRESETS[aoi]
@@ -140,6 +148,7 @@ def main(
         cloud_cover_max=cloud_cover_max,
         limit=limit,
         clip=not no_clip,
+        max_workers=workers,
     )
     click.echo(
         f"Downloaded {result.assets} assets across {result.scenes} scenes -> {result.out_dir}"
