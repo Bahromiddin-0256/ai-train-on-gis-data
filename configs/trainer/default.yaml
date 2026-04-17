@@ -1,0 +1,27 @@
+# Lightning Trainer config. Most fields map 1:1 to lightning.pytorch.Trainer.
+
+_target_: pytorch_lightning.Trainer
+
+max_epochs: 50
+accelerator: auto          # "cpu" | "gpu" | "auto"
+devices: auto
+precision: 32-true         # Use "16-mixed" on GPU for speedup
+log_every_n_steps: 10
+deterministic: true
+fast_dev_run: false        # Override from CLI for a 1-batch smoke run
+gradient_clip_val: 1.0
+check_val_every_n_epoch: 1
+enable_checkpointing: true
+enable_progress_bar: true
+
+callbacks:
+  - _target_: pytorch_lightning.callbacks.EarlyStopping
+    monitor: val/f1
+    patience: 10
+    mode: max
+    verbose: true
+  - _target_: pytorch_lightning.callbacks.ModelCheckpoint
+    monitor: val/f1
+    mode: max
+    save_top_k: 1
+    filename: "best-{epoch:02d}-{val_f1:.4f}"
