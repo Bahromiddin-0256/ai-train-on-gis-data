@@ -351,6 +351,283 @@ def fetch_chips_from_stac(
     return chips, labels
 
 
+def _fetch_single_window_chips(
+    gdf,
+    bands: Sequence[str],
+    date_start: str,
+    date_end: str,
+    chip_size: int,
+    cloud_cover_max: float,
+    min_native_px: int,
+    add_ndvi: bool,
+    catalog,
+) -> dict:
+    """Extract chips for one time window. Returns {poly_idx: np.ndarray}.
+
+    Same pipeline as fetch_chips_from_stac but:
+    - Returns a dict keyed by polygon index, not a list.
+    - Optionally appends NDVI as an extra channel after resizing.
+    - Does NOT require class_idx column (handled by caller).
+    - Skips min_native_px check for 20m-resolution bands (identified by
+      src.res[0] > 0.00015 degrees, since 10m ~ 0.0001 deg, 20m ~ 0.0002 deg).
+    """
+    from collections import defaultdict
+
+    import numpy as np
+    import planetary_computer  # type: ignore[import-not-found]
+    import torch
+    import torch.nn.functional as F
+    from pyproj import Transformer
+    from rasterio.windows import from_bounds
+    from tqdm import tqdm
+
+    import rasterio
+
+    # ------------------------------------------------------------------
+    # Step 1: single STAC query covering all polygons
+    # ------------------------------------------------------------------
+    total_bounds = tuple(float(x) for x in gdf.total_bounds)
+    _log.info(
+        "Querying STAC: bbox=(%.4f,%.4f,%.4f,%.4f) %s..%s",
+        *total_bounds, date_start, date_end,
+    )
+    all_items = list(
+        catalog.search(
+            collections=[_S2_L2A_COLLECTION],
+            bbox=total_bounds,
+            datetime=f"{date_start}/{date_end}",
+            query={"eo:cloud_cover": {"lt": cloud_cover_max}},
+            sortby=[{"field": "eo:cloud_cover", "direction": "asc"}],
+        ).items()
+    )
+    _log.info("Found %d candidate scenes", len(all_items))
+
+    if not all_items:
+        _log.warning("No scenes found for window %s..%s", date_start, date_end)
+        return {}
+
+    # ------------------------------------------------------------------
+    # Step 2: build scene bbox index (WGS-84), sorted ascending by cloud cover
+    # ------------------------------------------------------------------
+    scene_infos: list[tuple[str, tuple, object]] = []
+    for item in all_items:
+        geom = item.geometry
+        if geom and geom.get("type") == "Polygon":
+            coords = geom["coordinates"][0]
+            xs = [c[0] for c in coords]
+            ys = [c[1] for c in coords]
+            sbbox = (min(xs), min(ys), max(xs), max(ys))
+        elif item.bbox:
+            sbbox = tuple(item.bbox)
+        else:
+            continue
+        scene_infos.append((item.id, sbbox, item))
+
+    # ------------------------------------------------------------------
+    # Step 3: assign each polygon → best (least cloudy) covering scene
+    # ------------------------------------------------------------------
+    poly_to_scene: dict[int, str] = {}
+    scene_items: dict[str, object] = {}
+
+    for idx, row in gdf.iterrows():
+        geom = row.geometry
+        if geom is None or geom.is_empty:
+            continue
+        pb = geom.bounds
+        for scene_id, sbbox, item in scene_infos:
+            if pb[0] <= sbbox[2] and pb[2] >= sbbox[0] and pb[1] <= sbbox[3] and pb[3] >= sbbox[1]:
+                poly_to_scene[idx] = scene_id
+                scene_items[scene_id] = item
+                break
+
+    skipped_no_scene = len(gdf) - len(poly_to_scene)
+    _log.info(
+        "Assigned %d/%d polygons across %d scenes (%d unassigned)",
+        len(poly_to_scene), len(gdf), len(scene_items), skipped_no_scene,
+    )
+
+    scene_to_polys: dict[str, list[int]] = defaultdict(list)
+    for idx, scene_id in poly_to_scene.items():
+        scene_to_polys[scene_id].append(idx)
+
+    # ------------------------------------------------------------------
+    # Step 4: per-scene windowed reads — open each COG once
+    # ------------------------------------------------------------------
+    def _read_window_from_src(src, geom) -> np.ndarray | None:
+        nb = src.bounds
+        if src.crs.to_epsg() == 4326:
+            bx0, by0, bx1, by1 = geom.bounds
+        else:
+            t = Transformer.from_crs("EPSG:4326", src.crs, always_xy=True)
+            b = geom.bounds
+            corners = [
+                t.transform(b[0], b[1]), t.transform(b[2], b[1]),
+                t.transform(b[0], b[3]), t.transform(b[2], b[3]),
+            ]
+            xs, ys = zip(*corners)
+            bx0, bx1 = min(xs), max(xs)
+            by0, by1 = min(ys), max(ys)
+        bx0 = max(bx0, nb.left);  by0 = max(by0, nb.bottom)
+        bx1 = min(bx1, nb.right); by1 = min(by1, nb.top)
+        if bx0 >= bx1 or by0 >= by1:
+            return None
+        win = from_bounds(bx0, by0, bx1, by1, src.transform)
+        return src.read(window=win)
+
+    result: dict[int, np.ndarray] = {}
+    skipped_small = 0
+
+    for scene_id, poly_indices in tqdm(
+        scene_to_polys.items(), desc="scenes", unit="scene"
+    ):
+        item = scene_items[scene_id]
+        signed = planetary_computer.sign(item)
+        hrefs = {b: signed.assets[b].href for b in bands if b in signed.assets}
+        if len(hrefs) < len(bands):
+            continue
+
+        try:
+            band_srcs = [rasterio.open(hrefs[b]) for b in bands]
+        except Exception as exc:
+            _log.warning("Cannot open scene %s: %s", scene_id, exc)
+            continue
+
+        try:
+            for idx in tqdm(poly_indices, desc=f"  {scene_id[:28]}", unit="poly", leave=False):
+                row = gdf.loc[idx]
+                geom = row.geometry
+
+                band_arrays: list[np.ndarray] = []
+                ok = True
+                for b_name, src in zip(bands, band_srcs):
+                    arr = _read_window_from_src(src, geom)
+                    if arr is None:
+                        ok = False
+                        skipped_small += 1
+                        break
+                    # For 20m bands (res[0] > 0.00015 deg), skip min_native_px check
+                    # since F.interpolate will resize to chip_size anyway.
+                    is_20m = src.res[0] > 0.00015
+                    if not is_20m and (arr.shape[1] < min_native_px or arr.shape[2] < min_native_px):
+                        ok = False
+                        skipped_small += 1
+                        break
+                    band_arrays.append(arr)
+
+                if not ok:
+                    continue
+
+                stacked = np.concatenate(band_arrays, axis=0).astype(np.float32)
+                t = torch.from_numpy(stacked).unsqueeze(0)
+                resized = F.interpolate(
+                    t, size=(chip_size, chip_size), mode="bilinear", align_corners=False
+                )
+                chip = resized.squeeze(0).numpy()  # (C, chip_size, chip_size)
+
+                # Optionally append NDVI as an extra channel (computed from raw DN values)
+                if add_ndvi and "B08" in bands and "B04" in bands:
+                    b08 = chip[list(bands).index("B08")]
+                    b04 = chip[list(bands).index("B04")]
+                    ndvi_raw = (b08 - b04) / (b08 + b04 + 1e-3)  # [-1, 1]
+                    ndvi_dn = (ndvi_raw + 1.0) * 5000.0  # scale to [0, 10000]
+                    chip = np.concatenate([chip, ndvi_dn[np.newaxis]], axis=0)
+
+                result[idx] = chip
+        finally:
+            for src in band_srcs:
+                src.close()
+
+    _log.info(
+        "Window %s..%s: %d chips extracted (%d no-scene, %d too-small)",
+        date_start, date_end, len(result), skipped_no_scene, skipped_small,
+    )
+    return result
+
+
+def fetch_chips_multitemporal(
+    gdf,
+    bands: Sequence[str],
+    date_windows: Sequence[tuple[str, str]],
+    chip_size: int = 64,
+    cloud_cover_max: float = 20.0,
+    min_native_px: int = 4,
+    add_ndvi: bool = True,
+    max_missing_windows: int = 1,
+) -> tuple[list, list[int]]:
+    """Fetch per-polygon chips across multiple time windows.
+
+    For each polygon: collects chips from each window, concatenates along
+    the channel axis. Windows with no STAC coverage are zero-padded. Polygons
+    missing more than ``max_missing_windows`` windows are dropped.
+
+    Returns ``(chips, labels)`` where each chip has shape
+    ``(len(windows) * channels_per_window, chip_size, chip_size)``.
+
+    Parameters
+    ----------
+    gdf:
+        GeoDataFrame in EPSG:4326. Must have a ``class_idx`` integer column.
+    bands:
+        Sentinel-2 band IDs to fetch per window (e.g. ``["B02", "B03", "B04", "B08"]``).
+    date_windows:
+        Sequence of ``(date_start, date_end)`` pairs defining the time windows.
+    add_ndvi:
+        Append NDVI as an extra channel after the band channels for each window.
+    max_missing_windows:
+        Polygons with more than this many zero-padded windows are dropped.
+    """
+    import numpy as np
+    from pystac_client import Client  # type: ignore[import-not-found]
+
+    catalog = Client.open(_PC_STAC_URL)
+
+    n_channels_per_window = len(bands) + (1 if add_ndvi else 0)
+    zero_window = np.zeros((n_channels_per_window, chip_size, chip_size), dtype=np.float32)
+
+    # Collect chips per window: list of {poly_idx: chip}
+    window_results: list[dict[int, np.ndarray]] = []
+    for date_start, date_end in date_windows:
+        _log.info("Fetching window %s .. %s", date_start, date_end)
+        window_chips = _fetch_single_window_chips(
+            gdf=gdf,
+            bands=bands,
+            date_start=date_start,
+            date_end=date_end,
+            chip_size=chip_size,
+            cloud_cover_max=cloud_cover_max,
+            min_native_px=min_native_px,
+            add_ndvi=add_ndvi,
+            catalog=catalog,
+        )
+        window_results.append(window_chips)
+
+    # Collect all polygon indices that appear in ANY window
+    all_poly_indices: set[int] = set()
+    for wr in window_results:
+        all_poly_indices.update(wr.keys())
+
+    chips: list[np.ndarray] = []
+    labels: list[int] = []
+
+    for poly_idx in sorted(all_poly_indices):
+        missing = sum(1 for wr in window_results if poly_idx not in wr)
+        if missing > max_missing_windows:
+            continue
+
+        window_chips_list = [
+            wr.get(poly_idx, zero_window) for wr in window_results
+        ]
+        combined = np.concatenate(window_chips_list, axis=0)  # (n_windows * C, H, W)
+        chips.append(combined)
+        labels.append(int(gdf.loc[poly_idx, "class_idx"]))
+
+    _log.info(
+        "Multi-temporal done: %d chips from %d windows × %d ch/window",
+        len(chips), len(date_windows), n_channels_per_window,
+    )
+    return chips, labels
+
+
 def download_sentinel2_l2a(
     bbox: BBox,
     date_start: str,

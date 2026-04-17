@@ -72,7 +72,13 @@ def tiny_config_overrides() -> list[str]:
         "data.pin_memory=false",
         "data.val_split=0.25",
         "data.test_split=0.25",
+        # Use 4 bands for synthetic data so the tiny test runs fast and
+        # model.in_channels matches without needing 30-channel input.
+        "data.bands=[B02,B03,B04,B08]",
+        "data.mean=[0.1737,0.2178,0.2261,0.4629]",
+        "data.std=[0.0451,0.0536,0.0838,0.0701]",
         "model.backbone=resnet18",
+        "model.in_channels=4",
         "model.pretrained=false",
         "trainer.max_epochs=1",
         "trainer.accelerator=cpu",

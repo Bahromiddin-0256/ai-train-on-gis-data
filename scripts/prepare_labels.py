@@ -10,6 +10,12 @@ This produces much cleaner labels than the old tile-slicing approach, because
 each chip corresponds to exactly one labelled field.
 
 Output: ``images.npy`` (N, C, chip_size, chip_size) + ``labels.npy`` (N,).
+
+Multi-temporal mode (``--date-windows``):
+  Pass multiple date windows as comma-separated ``start:end`` pairs.
+  E.g. ``--date-windows 2025-04-01:2025-05-31,2025-06-01:2025-07-31``.
+  Each polygon gets chips from all windows concatenated along the channel axis.
+  Windows with no STAC coverage are zero-padded.
 """
 
 from __future__ import annotations
@@ -234,6 +240,22 @@ def _extract_chip(
     show_default=True,
     help="Comma-separated band IDs (used only with --from-stac).",
 )
+@click.option(
+    "--date-windows",
+    type=str,
+    default=None,
+    help=(
+        "Comma-separated 'start:end' pairs for multi-temporal windows. "
+        "E.g. '2025-04-01:2025-05-31,2025-06-01:2025-07-31,2025-08-01:2025-09-30'. "
+        "When set, overrides --date-start/--date-end."
+    ),
+)
+@click.option(
+    "--add-ndvi",
+    is_flag=True,
+    default=True,
+    help="Append NDVI as an extra channel (used with --from-stac, default on).",
+)
 def main(
     tiles_dir: Path | None,
     vectors: Path,
@@ -245,6 +267,8 @@ def main(
     date_start: str,
     date_end: str,
     bands: str,
+    date_windows: str | None,
+    add_ndvi: bool,
 ) -> None:
     """Produce images.npy + labels.npy using polygon-level chips (one chip per field).
 
@@ -273,20 +297,45 @@ def main(
     # Mode A: read directly from Planetary Computer STAC
     # -----------------------------------------------------------------------
     if from_stac:
-        from gis_train.data.download import fetch_chips_from_stac
-
         band_list = [b.strip() for b in bands.split(",") if b.strip()]
         gdf["class_idx"] = gdf[class_field].map(class_to_idx)
         gdf = gdf[gdf["class_idx"].notna()].copy()
 
-        chips, label_list = fetch_chips_from_stac(
-            gdf=gdf,
-            bands=band_list,
-            date_start=date_start,
-            date_end=date_end,
-            chip_size=chip_size,
-            min_native_px=min_pixels,
-        )
+        if date_windows is not None:
+            from gis_train.data.download import fetch_chips_multitemporal
+
+            # Parse "start1:end1,start2:end2,..." into list of (start, end) tuples
+            windows: list[tuple[str, str]] = []
+            for pair in date_windows.split(","):
+                pair = pair.strip()
+                if not pair:
+                    continue
+                parts = pair.split(":")
+                if len(parts) != 2:
+                    raise click.UsageError(
+                        f"Invalid date window {pair!r}; expected 'YYYY-MM-DD:YYYY-MM-DD'"
+                    )
+                windows.append((parts[0].strip(), parts[1].strip()))
+
+            chips, label_list = fetch_chips_multitemporal(
+                gdf=gdf,
+                bands=band_list,
+                date_windows=windows,
+                chip_size=chip_size,
+                min_native_px=min_pixels,
+                add_ndvi=add_ndvi,
+            )
+        else:
+            from gis_train.data.download import fetch_chips_from_stac
+
+            chips, label_list = fetch_chips_from_stac(
+                gdf=gdf,
+                bands=band_list,
+                date_start=date_start,
+                date_end=date_end,
+                chip_size=chip_size,
+                min_native_px=min_pixels,
+            )
 
         if not chips:
             raise RuntimeError("no chips produced — check vectors and date range")

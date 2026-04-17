@@ -10,7 +10,7 @@ _recursive_: false
 backbone: resnet50
 
 # Number of input channels (must match data.bands length).
-in_channels: 4
+in_channels: 30
 
 # Number of output classes (must match len(data.classes)).
 num_classes: 3

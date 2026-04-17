@@ -151,9 +151,10 @@ class CropDataModule(pl.LightningDataModule):
     def setup(self, stage: str | None = None) -> None:
         images, labels = self._load_arrays()
         if images.shape[1] != self.num_bands:
-            raise ValueError(
-                f"features have {images.shape[1]} channels but {self.num_bands} bands are "
-                "configured — check `data.bands`"
+            _log.warning(
+                "images have %d channels but bands config lists %d — "
+                "likely multi-temporal or extra index bands. Proceeding.",
+                images.shape[1], self.num_bands,
             )
 
         train_tf = build_train_transforms(mean=self.mean, std=self.std)

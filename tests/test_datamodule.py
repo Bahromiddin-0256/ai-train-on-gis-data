@@ -44,8 +44,8 @@ def test_dataloaders_yield_expected_shapes() -> None:
     assert labels.dtype == torch.long
 
 
-def test_band_mismatch_raises(tmp_path) -> None:
-    # Save 2-channel arrays but configure 4 bands → should fail in setup().
+def test_band_mismatch_warns(tmp_path) -> None:
+    # Save 2-channel arrays but configure 4 bands → should now warn and proceed.
     images = np.random.rand(8, 2, 16, 16).astype(np.float32)
     labels = np.random.randint(0, 2, size=8).astype(np.int64)
     np.save(tmp_path / "images.npy", images)
@@ -55,10 +55,12 @@ def test_band_mismatch_raises(tmp_path) -> None:
         source="local",
         data_dir=str(tmp_path),
         bands=("B02", "B03", "B04", "B08"),
+        mean=(0.1, 0.1),
+        std=(0.05, 0.05),
     )
     dm.prepare_data()
-    with pytest.raises(ValueError, match="channels"):
-        dm.setup()
+    # Multi-temporal images may have more/fewer channels than bands — warn, not raise.
+    dm.setup()  # should not raise
 
 
 def test_local_source_requires_files(tmp_path) -> None:

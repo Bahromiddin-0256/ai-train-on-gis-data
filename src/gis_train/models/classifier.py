@@ -28,10 +28,13 @@ from gis_train.utils.logging import get_logger
 _log = get_logger(__name__)
 
 
-# Sentinel-2 ALL-band order used by torchgeo SENTINEL2_ALL_MOCO weights.
-# Indices of our 4 working bands (B02, B03, B04, B08) within this ordering.
+# Sentinel-2 ALL-band order used by torchgeo SENTINEL2_ALL_MOCO weights (13 bands).
 _S2_ALL_BANDS = ["B01", "B02", "B03", "B04", "B05", "B06", "B07", "B08", "B08A", "B09", "B10", "B11", "B12"]
-_S2_WORKING_BAND_INDICES = [_S2_ALL_BANDS.index(b) for b in ["B02", "B03", "B04", "B08"]]
+# 9-band working set: 10m + selected 20m bands (excludes B08A, B09, B10, B01).
+_S2_WORKING_9 = ["B02", "B03", "B04", "B05", "B06", "B07", "B08", "B11", "B12"]
+_S2_WORKING_BAND_INDICES = [_S2_ALL_BANDS.index(b) for b in _S2_WORKING_9]
+# = [1, 2, 3, 4, 5, 6, 7, 11, 12]
+_S2_B08_IDX_IN_13 = _S2_ALL_BANDS.index("B08")  # = 7, used for NDVI channel init
 
 
 def _build_backbone(name: str, in_channels: int, pretrained: bool) -> tuple[nn.Module, int]:
@@ -67,13 +70,57 @@ def _build_backbone(name: str, in_channels: int, pretrained: bool) -> tuple[nn.M
                         bias=old_conv.bias is not None,
                     )
                     with torch.no_grad():
-                        indices = _S2_WORKING_BAND_INDICES[:in_channels]
-                        new_conv.weight.copy_(old_conv.weight[:, indices, :, :])
+                        pretrained_w = old_conv.weight  # (out_ch, 13, kH, kW)
+
+                        if in_channels == len(_S2_WORKING_9):
+                            # Single-temporal 9-band: direct index mapping
+                            new_conv.weight.copy_(pretrained_w[:, _S2_WORKING_BAND_INDICES, :, :])
+                        elif in_channels == len(_S2_WORKING_9) + 1:
+                            # Single-temporal 9-band + NDVI (10 channels)
+                            new_conv.weight[:, :len(_S2_WORKING_9)] = pretrained_w[:, _S2_WORKING_BAND_INDICES, :, :]
+                            new_conv.weight[:, len(_S2_WORKING_9)] = pretrained_w[:, _S2_B08_IDX_IN_13, :, :]
+                        else:
+                            # Multi-temporal: in_channels = n_windows * n_ch_per_window
+                            n_ch_detected = None
+                            n_windows_detected = None
+                            for n_win in [3, 2, 4]:
+                                if in_channels % n_win == 0:
+                                    n_ch_detected = in_channels // n_win
+                                    n_windows_detected = n_win
+                                    break
+
+                            if n_ch_detected is None:
+                                _log.warning(
+                                    "in_channels=%d: no pretrained mapping found, using random init",
+                                    in_channels,
+                                )
+                                nn.init.kaiming_normal_(new_conv.weight, mode="fan_out", nonlinearity="relu")
+                            else:
+                                scale = 1.0 / (n_windows_detected ** 0.5)
+                                for w in range(n_windows_detected):
+                                    start = w * n_ch_detected
+                                    if n_ch_detected == len(_S2_WORKING_9):
+                                        new_conv.weight[:, start:start + n_ch_detected] = (
+                                            pretrained_w[:, _S2_WORKING_BAND_INDICES] * scale
+                                        )
+                                    elif n_ch_detected == len(_S2_WORKING_9) + 1:
+                                        new_conv.weight[:, start:start + len(_S2_WORKING_9)] = (
+                                            pretrained_w[:, _S2_WORKING_BAND_INDICES] * scale
+                                        )
+                                        new_conv.weight[:, start + len(_S2_WORKING_9)] = (
+                                            pretrained_w[:, _S2_B08_IDX_IN_13] * scale
+                                        )
+                                    else:
+                                        nn.init.kaiming_normal_(
+                                            new_conv.weight[:, start:start + n_ch_detected],
+                                            mode="fan_out", nonlinearity="relu",
+                                        )
+                                _log.info(
+                                    "patched first conv: 13 → %d channels "
+                                    "(%d windows × %d ch/window, scale=%.3f)",
+                                    in_channels, n_windows_detected, n_ch_detected, scale,
+                                )
                     backbone.conv1 = new_conv
-                    _log.info(
-                        "patched first conv: 13 → %d channels (band indices %s)",
-                        in_channels, indices,
-                    )
             else:
                 backbone = resnet50(weights=None, in_chans=in_channels)
                 feature_dim = backbone.num_features
@@ -91,6 +138,40 @@ def _build_backbone(name: str, in_channels: int, pretrained: bool) -> tuple[nn.M
         from torchvision.models import resnet18 as tv_resnet18
 
         model = tv_resnet18(weights=None)
+    elif name == "convnext_tiny":
+        from torchvision.models import ConvNeXt_Tiny_Weights, convnext_tiny
+
+        weights = ConvNeXt_Tiny_Weights.IMAGENET1K_V1 if pretrained else None
+        model = convnext_tiny(weights=weights)
+
+        # First conv is model.features[0][0]: Conv2d(3, 96, kernel_size=4, stride=4)
+        old_conv = model.features[0][0]
+        feature_dim = model.classifier[2].in_features  # 768
+
+        new_conv = nn.Conv2d(
+            in_channels,
+            old_conv.out_channels,
+            kernel_size=old_conv.kernel_size,
+            stride=old_conv.stride,
+            padding=old_conv.padding,
+            bias=old_conv.bias is not None,
+        )
+        with torch.no_grad():
+            if pretrained and old_conv.weight.shape[1] == 3:
+                # ImageNet pretrained: 3 channels. Tile to in_channels.
+                # Each tile of 3 channels gets pretrained weights / (in_channels/3).
+                reps = in_channels // 3
+                remainder = in_channels % 3
+                tiled = old_conv.weight.repeat(1, reps + (1 if remainder else 0), 1, 1)
+                tiled = tiled[:, :in_channels, :, :]
+                scale = 3.0 / in_channels
+                new_conv.weight.copy_(tiled * scale)
+            else:
+                nn.init.kaiming_normal_(new_conv.weight, mode="fan_out", nonlinearity="relu")
+
+        model.features[0][0] = new_conv
+        model.classifier[2] = nn.Identity()
+        return model, feature_dim
     else:
         raise ValueError(f"unknown backbone: {name!r}")
 
