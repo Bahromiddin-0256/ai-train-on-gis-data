@@ -517,12 +517,14 @@ def _fetch_single_window_chips(
                 if not ok:
                     continue
 
-                stacked = np.concatenate(band_arrays, axis=0).astype(np.float32)
-                t = torch.from_numpy(stacked).unsqueeze(0)
-                resized = F.interpolate(
-                    t, size=(chip_size, chip_size), mode="bilinear", align_corners=False
-                )
-                chip = resized.squeeze(0).numpy()  # (C, chip_size, chip_size)
+                # Resize each band individually before concatenating —
+                # 10m and 20m bands have different native pixel counts for the same window.
+                resized_bands: list[np.ndarray] = []
+                for arr in band_arrays:
+                    t_band = torch.from_numpy(arr.astype(np.float32)).unsqueeze(0)
+                    r = F.interpolate(t_band, size=(chip_size, chip_size), mode="bilinear", align_corners=False)
+                    resized_bands.append(r.squeeze(0).numpy())
+                chip = np.concatenate(resized_bands, axis=0)  # (C, chip_size, chip_size)
 
                 # Optionally append NDVI as an extra channel (computed from raw DN values)
                 if add_ndvi and "B08" in bands and "B04" in bands:
