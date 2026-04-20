@@ -1,0 +1,31 @@
+# Temporal crop classifier: per-date 2D CNN + TempCNN along the time axis.
+#
+# Input channels are expected to be grouped as n_windows × channels_per_window;
+# the model reshapes (B, T*C, H, W) → (B, T, C, H, W) internally.
+
+_target_: gis_train.models.temporal.TemporalCropClassifier
+_recursive_: false
+
+# Must match data.n_windows × data.channels_per_window.
+n_windows: 3
+channels_per_window: 10
+
+num_classes: 3
+spatial_feature_dim: 256
+temporal_encoder: tempcnn    # "tempcnn" | "gru"
+temporal_hidden: 256
+
+class_weights: null
+label_smoothing: 0.1
+loss: ce                     # "ce" | "focal"
+focal_gamma: 2.0
+test_time_augmentation: false
+
+optimizer:
+  _target_: torch.optim.AdamW
+  lr: 1.0e-3
+  weight_decay: 1.0e-4
+
+scheduler:
+  _target_: torch.optim.lr_scheduler.CosineAnnealingLR
+  T_max: ${trainer.max_epochs}

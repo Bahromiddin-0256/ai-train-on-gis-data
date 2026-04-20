@@ -112,6 +112,53 @@ class GaussianNoise:
         return x + torch.randn_like(x) * self._std
 
 
+class BandDropout:
+    """Zero out random input channels to encourage redundancy across bands."""
+
+    def __init__(self, p: float = 0.1) -> None:
+        if not 0.0 <= p < 1.0:
+            raise ValueError("p must be in [0, 1)")
+        self._p = p
+
+    def __call__(self, x: torch.Tensor) -> torch.Tensor:
+        if self._p == 0.0:
+            return x
+        mask = (torch.rand(x.shape[0], 1, 1, device=x.device) >= self._p).to(x.dtype)
+        return x * mask
+
+
+class TemporalDropout:
+    """Zero out an entire temporal window (block of channels).
+
+    Assumes a multi-temporal tensor where channels are grouped as
+    ``n_windows × channels_per_window``. Drops ``p`` fraction of windows.
+    """
+
+    def __init__(self, n_windows: int, p: float = 0.15) -> None:
+        if n_windows <= 0:
+            raise ValueError("n_windows must be positive")
+        if not 0.0 <= p < 1.0:
+            raise ValueError("p must be in [0, 1)")
+        self._n_windows = n_windows
+        self._p = p
+
+    def __call__(self, x: torch.Tensor) -> torch.Tensor:
+        if self._p == 0.0:
+            return x
+        c = x.shape[0]
+        if c % self._n_windows != 0:
+            raise ValueError(
+                f"channels ({c}) not divisible by n_windows ({self._n_windows})"
+            )
+        ch_per = c // self._n_windows
+        mask = (torch.rand(self._n_windows, device=x.device) >= self._p).to(x.dtype)
+        # Ensure we don't drop all windows.
+        if mask.sum() == 0:
+            mask[torch.randint(0, self._n_windows, ())] = 1.0
+        full = mask.repeat_interleave(ch_per).view(c, 1, 1)
+        return x * full
+
+
 class Compose:
     """Sequentially apply a list of transforms."""
 
@@ -128,19 +175,30 @@ def build_train_transforms(
     mean: Sequence[float],
     std: Sequence[float],
     scale: float = 10_000.0,
+    n_windows: int | None = None,
+    temporal_dropout: float = 0.0,
+    band_dropout: float = 0.0,
 ) -> Transform:
-    """Return the default augmentation pipeline used during training."""
-    return Compose(
-        [
-            ScaleReflectance(scale=scale),
-            Normalize(mean=mean, std=std),
-            RandomHFlip(p=0.5),
-            RandomVFlip(p=0.5),
-            RandomRotation90(),
-            SpectralJitter(brightness=0.1, contrast=0.1),
-            GaussianNoise(std=0.01),
-        ]
-    )
+    """Return the default augmentation pipeline used during training.
+
+    ``n_windows`` + ``temporal_dropout`` enable whole-timestamp dropout for
+    multi-temporal inputs (channels grouped as ``n_windows × ch_per_window``).
+    ``band_dropout`` randomly zeroes individual channels.
+    """
+    tfs: list[Transform] = [
+        ScaleReflectance(scale=scale),
+        Normalize(mean=mean, std=std),
+        RandomHFlip(p=0.5),
+        RandomVFlip(p=0.5),
+        RandomRotation90(),
+        SpectralJitter(brightness=0.1, contrast=0.1),
+        GaussianNoise(std=0.01),
+    ]
+    if band_dropout > 0.0:
+        tfs.append(BandDropout(p=band_dropout))
+    if temporal_dropout > 0.0 and n_windows:
+        tfs.append(TemporalDropout(n_windows=n_windows, p=temporal_dropout))
+    return Compose(tfs)
 
 
 def build_val_transforms(

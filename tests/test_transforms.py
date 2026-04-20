@@ -6,11 +6,13 @@ import pytest
 import torch
 
 from gis_train.data.transforms import (
+    BandDropout,
     Compose,
     Normalize,
     RandomHFlip,
     RandomVFlip,
     ScaleReflectance,
+    TemporalDropout,
     build_train_transforms,
     build_val_transforms,
 )
@@ -66,3 +68,35 @@ def test_builders_return_callable() -> None:
     x = torch.full((4, 4, 4), 5_000.0)
     assert train(x).shape == x.shape
     assert val(x).shape == x.shape
+
+
+def test_band_dropout_zeros_some_channels() -> None:
+    torch.manual_seed(0)
+    x = torch.ones(8, 4, 4)
+    out = BandDropout(p=0.5)(x)
+    # Per-channel sums are either 16 (kept) or 0 (dropped).
+    sums = out.sum(dim=(1, 2))
+    for v in sums.tolist():
+        assert v == 16.0 or v == 0.0
+
+
+def test_temporal_dropout_drops_whole_windows() -> None:
+    torch.manual_seed(0)
+    # 3 windows of 2 channels each = 6 total.
+    x = torch.arange(6 * 2 * 2, dtype=torch.float32).reshape(6, 2, 2) + 1.0
+    tf = TemporalDropout(n_windows=3, p=0.99)
+    out = tf(x)
+    # Windows are contiguous blocks of 2 channels; a dropped window zeros both.
+    for w in range(3):
+        block = out[2 * w : 2 * w + 2]
+        either_all_zero = bool((block == 0).all())
+        matches_input = torch.equal(block, x[2 * w : 2 * w + 2])
+        assert either_all_zero or matches_input
+    # At least one window should remain (collate ensures non-empty).
+    assert out.abs().sum() > 0
+
+
+def test_temporal_dropout_rejects_bad_shape() -> None:
+    tf = TemporalDropout(n_windows=3, p=0.5)
+    with pytest.raises(ValueError):
+        tf(torch.zeros(5, 2, 2))

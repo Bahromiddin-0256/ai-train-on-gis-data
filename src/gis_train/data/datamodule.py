@@ -20,6 +20,7 @@ import pytorch_lightning as pl
 from torch.utils.data import DataLoader, Subset
 
 from gis_train.data.dataset import CropClassificationDataset
+from gis_train.data.mixup import MixupCutmixCollate
 from gis_train.data.transforms import build_train_transforms, build_val_transforms
 from gis_train.utils.logging import get_logger
 
@@ -93,6 +94,13 @@ class CropDataModule(pl.LightningDataModule):
         classes: Sequence[str] = ("non_crop", "crop"),
         seed: int = 42,
         synthetic_n: int = 128,
+        n_windows: int | None = None,
+        temporal_dropout: float = 0.0,
+        band_dropout: float = 0.0,
+        mixup_alpha: float = 0.0,
+        cutmix_alpha: float = 0.0,
+        mix_prob: float = 0.5,
+        mix_switch_prob: float = 0.5,
     ) -> None:
         super().__init__()
         # Hydra-instantiated kwargs live on self via save_hyperparameters() so
@@ -119,6 +127,13 @@ class CropDataModule(pl.LightningDataModule):
         self.classes = tuple(classes)
         self.seed = seed
         self.synthetic_n = synthetic_n
+        self.n_windows = n_windows
+        self.temporal_dropout = temporal_dropout
+        self.band_dropout = band_dropout
+        self.mixup_alpha = mixup_alpha
+        self.cutmix_alpha = cutmix_alpha
+        self.mix_prob = mix_prob
+        self.mix_switch_prob = mix_switch_prob
 
         self._train: CropClassificationDataset | Subset | None = None
         self._val: CropClassificationDataset | Subset | None = None
@@ -157,7 +172,13 @@ class CropDataModule(pl.LightningDataModule):
                 images.shape[1], self.num_bands,
             )
 
-        train_tf = build_train_transforms(mean=self.mean, std=self.std)
+        train_tf = build_train_transforms(
+            mean=self.mean,
+            std=self.std,
+            n_windows=self.n_windows,
+            temporal_dropout=self.temporal_dropout,
+            band_dropout=self.band_dropout,
+        )
         eval_tf = build_val_transforms(mean=self.mean, std=self.std)
 
         if self.external_test_dir is not None:
@@ -217,7 +238,7 @@ class CropDataModule(pl.LightningDataModule):
     # DataLoader factories
     # ------------------------------------------------------------------
 
-    def _loader(self, dataset, *, shuffle: bool) -> DataLoader:
+    def _loader(self, dataset, *, shuffle: bool, collate_fn=None) -> DataLoader:
         return DataLoader(
             dataset,
             batch_size=self.batch_size,
@@ -226,11 +247,24 @@ class CropDataModule(pl.LightningDataModule):
             pin_memory=self.pin_memory,
             drop_last=shuffle,
             persistent_workers=self.num_workers > 0,
+            collate_fn=collate_fn,
+        )
+
+    def _train_collate(self):
+        if self.mixup_alpha <= 0.0 and self.cutmix_alpha <= 0.0:
+            return None
+        return MixupCutmixCollate(
+            num_classes=self.num_classes,
+            mixup_alpha=self.mixup_alpha,
+            cutmix_alpha=self.cutmix_alpha,
+            switch_prob=self.mix_switch_prob,
+            p=self.mix_prob,
+            seed=self.seed,
         )
 
     def train_dataloader(self) -> DataLoader:
         assert self._train is not None, "call setup() first"
-        return self._loader(self._train, shuffle=True)
+        return self._loader(self._train, shuffle=True, collate_fn=self._train_collate())
 
     def val_dataloader(self) -> DataLoader:
         assert self._val is not None, "call setup() first"

@@ -13,6 +13,7 @@ from typing import Any
 import pytorch_lightning as pl
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from hydra.utils import instantiate
 from omegaconf import DictConfig
 from torch.optim import Optimizer
@@ -23,6 +24,7 @@ from torchmetrics.classification import (
     MulticlassF1Score,
 )
 
+from gis_train.models.losses import FocalLoss
 from gis_train.utils.logging import get_logger
 
 _log = get_logger(__name__)
@@ -83,7 +85,7 @@ def _build_backbone(name: str, in_channels: int, pretrained: bool) -> tuple[nn.M
                             # Multi-temporal: in_channels = n_windows * n_ch_per_window
                             n_ch_detected = None
                             n_windows_detected = None
-                            for n_win in [3, 2, 4]:
+                            for n_win in [3, 2, 4, 6, 12]:
                                 if in_channels % n_win == 0:
                                     n_ch_detected = in_channels // n_win
                                     n_windows_detected = n_win
@@ -190,6 +192,19 @@ def _build_backbone(name: str, in_channels: int, pretrained: bool) -> tuple[nn.M
     return model, feature_dim
 
 
+def _tta_forward(model: nn.Module, x: torch.Tensor) -> torch.Tensor:
+    """Average softmax probs over 8 D4 augmentations (flips × 4 rotations)."""
+    probs_sum = torch.zeros(x.shape[0], model.head.out_features, device=x.device, dtype=x.dtype)
+    n = 0
+    for k in range(4):
+        xr = torch.rot90(x, k=k, dims=[-2, -1])
+        for flip in (False, True):
+            xi = torch.flip(xr, dims=[-1]) if flip else xr
+            probs_sum = probs_sum + F.softmax(model(xi), dim=1)
+            n += 1
+    return torch.log(probs_sum / n + 1e-12)
+
+
 class CropClassifier(pl.LightningModule):
     """LightningModule wrapping a ResNet backbone + linear classifier head."""
 
@@ -201,6 +216,11 @@ class CropClassifier(pl.LightningModule):
         pretrained: bool = True,
         class_weights: list[float] | None = None,
         label_smoothing: float = 0.0,
+        loss: str = "ce",
+        focal_gamma: float = 2.0,
+        backbone_lr_mult: float = 1.0,
+        warmup_epochs: int = 0,
+        test_time_augmentation: bool = False,
         optimizer: DictConfig | dict[str, Any] | None = None,
         scheduler: DictConfig | dict[str, Any] | None = None,
     ) -> None:
@@ -213,11 +233,23 @@ class CropClassifier(pl.LightningModule):
         self.head = nn.Linear(feature_dim, num_classes)
 
         weight = torch.tensor(class_weights, dtype=torch.float32) if class_weights else None
-        self.loss_fn = nn.CrossEntropyLoss(weight=weight, label_smoothing=label_smoothing)
+        if loss == "ce":
+            self.loss_fn: nn.Module = nn.CrossEntropyLoss(
+                weight=weight, label_smoothing=label_smoothing
+            )
+        elif loss == "focal":
+            self.loss_fn = FocalLoss(
+                gamma=focal_gamma, weight=weight, label_smoothing=label_smoothing
+            )
+        else:
+            raise ValueError(f"unknown loss: {loss!r}")
 
         self._optimizer_cfg = optimizer
         self._scheduler_cfg = scheduler
         self._num_classes = num_classes
+        self._backbone_lr_mult = backbone_lr_mult
+        self._warmup_epochs = warmup_epochs
+        self._tta = test_time_augmentation
 
         metric_kwargs = {"num_classes": num_classes, "average": "macro"}
         self.train_acc = MulticlassAccuracy(num_classes=num_classes)
@@ -235,13 +267,25 @@ class CropClassifier(pl.LightningModule):
         features = self.backbone(x)
         return self.head(features)
 
+    def _eval_forward(self, x: torch.Tensor) -> torch.Tensor:
+        if self._tta:
+            return _tta_forward(self, x)
+        return self(x)
+
     def _shared_step(
         self, batch: tuple[torch.Tensor, torch.Tensor]
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         images, labels = batch
         logits = self(images)
-        loss = self.loss_fn(logits, labels)
-        return loss, logits, labels
+        # Mixup/CutMix collate emits soft labels (B, C); cross-entropy handles both.
+        if labels.dim() == 2:
+            log_probs = F.log_softmax(logits, dim=1)
+            loss = -(labels * log_probs).sum(dim=1).mean()
+            hard_labels = labels.argmax(dim=1)
+        else:
+            loss = self.loss_fn(logits, labels)
+            hard_labels = labels
+        return loss, logits, hard_labels
 
     def training_step(
         self, batch: tuple[torch.Tensor, torch.Tensor], batch_idx: int
@@ -253,18 +297,23 @@ class CropClassifier(pl.LightningModule):
         return loss
 
     def validation_step(self, batch: tuple[torch.Tensor, torch.Tensor], batch_idx: int) -> None:
-        loss, logits, labels = self._shared_step(batch)
-        self.val_acc(logits, labels)
-        self.val_f1(logits, labels)
+        images, labels = batch
+        logits = self._eval_forward(images)
+        loss = self.loss_fn(logits, labels) if labels.dim() == 1 else F.cross_entropy(logits, labels)
+        self.val_acc(logits, labels if labels.dim() == 1 else labels.argmax(dim=1))
+        self.val_f1(logits, labels if labels.dim() == 1 else labels.argmax(dim=1))
         self.log("val/loss", loss, prog_bar=True, on_epoch=True)
         self.log("val/acc", self.val_acc, prog_bar=True, on_epoch=True)
         self.log("val/f1", self.val_f1, prog_bar=False, on_epoch=True)
 
     def test_step(self, batch: tuple[torch.Tensor, torch.Tensor], batch_idx: int) -> None:
-        loss, logits, labels = self._shared_step(batch)
-        self.test_acc(logits, labels)
-        self.test_f1(logits, labels)
-        self.test_confmat(logits, labels)
+        images, labels = batch
+        logits = self._eval_forward(images)
+        loss = self.loss_fn(logits, labels) if labels.dim() == 1 else F.cross_entropy(logits, labels)
+        hard = labels if labels.dim() == 1 else labels.argmax(dim=1)
+        self.test_acc(logits, hard)
+        self.test_f1(logits, hard)
+        self.test_confmat(logits, hard)
         self.log("test/loss", loss, on_epoch=True)
         self.log("test/acc", self.test_acc, on_epoch=True)
         self.log("test/f1", self.test_f1, on_epoch=True)
@@ -273,16 +322,48 @@ class CropClassifier(pl.LightningModule):
     # Optimizers / schedulers
     # ------------------------------------------------------------------
 
+    def _param_groups(self, base_lr: float) -> list[dict[str, Any]]:
+        if self._backbone_lr_mult == 1.0:
+            return [{"params": list(self.parameters())}]
+        return [
+            {"params": list(self.backbone.parameters()), "lr": base_lr * self._backbone_lr_mult},
+            {"params": list(self.head.parameters()), "lr": base_lr},
+        ]
+
     def configure_optimizers(self) -> Optimizer | dict[str, Any]:
         opt_cfg = self._optimizer_cfg or {
             "_target_": "torch.optim.AdamW",
             "lr": 1.0e-4,
             "weight_decay": 1.0e-4,
         }
-        optimizer: Optimizer = instantiate(opt_cfg, params=self.parameters())
+        base_lr = float(opt_cfg.get("lr", 1.0e-4)) if hasattr(opt_cfg, "get") else 1.0e-4
+        optimizer: Optimizer = instantiate(opt_cfg, params=self._param_groups(base_lr))
 
-        if self._scheduler_cfg is None:
+        if self._scheduler_cfg is None and self._warmup_epochs <= 0:
             return optimizer
+
+        if self._warmup_epochs > 0:
+            warmup = self._warmup_epochs
+            main_scheduler: LRScheduler | None = (
+                instantiate(self._scheduler_cfg, optimizer=optimizer)
+                if self._scheduler_cfg is not None
+                else None
+            )
+
+            def lr_lambda(epoch: int) -> float:
+                if epoch < warmup:
+                    return (epoch + 1) / warmup
+                return 1.0
+
+            warmup_sched = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
+            if main_scheduler is None:
+                return {"optimizer": optimizer, "lr_scheduler": warmup_sched}
+            sched = torch.optim.lr_scheduler.SequentialLR(
+                optimizer,
+                schedulers=[warmup_sched, main_scheduler],
+                milestones=[warmup],
+            )
+            return {"optimizer": optimizer, "lr_scheduler": sched}
 
         scheduler: LRScheduler = instantiate(self._scheduler_cfg, optimizer=optimizer)
         return {"optimizer": optimizer, "lr_scheduler": scheduler}
