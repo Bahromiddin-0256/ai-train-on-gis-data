@@ -31,15 +31,22 @@ date_start: "2025-04-01"
 date_end: "2025-09-30"
 cloud_cover_max: 20
 
-# Sentinel-2 bands fetched per time window (9 bands; NDVI is computed during extraction).
-# The actual number of image channels is len(bands) * n_windows (e.g. 9 * 3 = 27)
-# plus NDVI per window (e.g. 3), giving 30 total. The model in_channels must match.
+# Sentinel-2 bands fetched per time window (9 raw bands).
+# Spectral indices are computed at chip-fetch time and appended per window.
+# Channel layout: (9 bands + 6 indices) × 3 windows = 15 ch/window × 3 = 45 total.
+# Model in_channels must match (resnet50_s2/convnext_s2: 45, tempcnn_s2: channels_per_window=15).
+# Recompute mean/std after rebuilding the dataset:
+#   python scripts/compute_band_stats.py \
+#       --images data/processed_regional_mt/images.npy \
+#       --out configs/data/uzbekistan_s2.yaml
 bands: ["B02", "B03", "B04", "B05", "B06", "B07", "B08", "B11", "B12"]
+indices: ["ndvi", "evi", "ndwi", "ndre", "msi", "nbr"]
 
-# Per-channel normalization for 30-channel multi-temporal input (3 windows × 10 ch/window).
-# Placeholder values — recompute with: python scripts/compute_band_stats.py
-mean: [0.1500, 0.1500, 0.1500, 0.1500, 0.1500, 0.1500, 0.1500, 0.1500, 0.1500, 0.1500, 0.1500, 0.1500, 0.1500, 0.1500, 0.1500, 0.1500, 0.1500, 0.1500, 0.1500, 0.1500, 0.1500, 0.1500, 0.1500, 0.1500, 0.1500, 0.1500, 0.1500, 0.1500, 0.1500, 0.1500]
-std:  [0.1000, 0.1000, 0.1000, 0.1000, 0.1000, 0.1000, 0.1000, 0.1000, 0.1000, 0.1000, 0.1000, 0.1000, 0.1000, 0.1000, 0.1000, 0.1000, 0.1000, 0.1000, 0.1000, 0.1000, 0.1000, 0.1000, 0.1000, 0.1000, 0.1000, 0.1000, 0.1000, 0.1000, 0.1000, 0.1000]
+# Per-channel normalization for 45-channel input (3 windows × 15 ch/window).
+# Order per window: B02,B03,B04,B05,B06,B07,B08,B11,B12,NDVI,EVI,NDWI,NDRE,MSI,NBR
+# Placeholder values — recompute with compute_band_stats.py after rebuilding images.npy.
+mean: [0.1500, 0.1500, 0.1500, 0.1500, 0.1500, 0.1500, 0.1500, 0.1500, 0.1500, 0.1500, 0.1500, 0.1500, 0.1500, 0.1500, 0.1500, 0.1500, 0.1500, 0.1500, 0.1500, 0.1500, 0.1500, 0.1500, 0.1500, 0.1500, 0.1500, 0.1500, 0.1500, 0.1500, 0.1500, 0.1500, 0.1500, 0.1500, 0.1500, 0.1500, 0.1500, 0.1500, 0.1500, 0.1500, 0.1500, 0.1500, 0.1500, 0.1500, 0.1500, 0.1500, 0.1500]
+std:  [0.1000, 0.1000, 0.1000, 0.1000, 0.1000, 0.1000, 0.1000, 0.1000, 0.1000, 0.1000, 0.1000, 0.1000, 0.1000, 0.1000, 0.1000, 0.1000, 0.1000, 0.1000, 0.1000, 0.1000, 0.1000, 0.1000, 0.1000, 0.1000, 0.1000, 0.1000, 0.1000, 0.1000, 0.1000, 0.1000, 0.1000, 0.1000, 0.1000, 0.1000, 0.1000, 0.1000, 0.1000, 0.1000, 0.1000, 0.1000, 0.1000, 0.1000, 0.1000, 0.1000, 0.1000]
 
 # Image patch size fed to the model.
 image_size: 64

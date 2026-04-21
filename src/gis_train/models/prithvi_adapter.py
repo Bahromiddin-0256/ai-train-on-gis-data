@@ -307,6 +307,12 @@ class Sentinel2ToHLSMapper:
             # 3 timesteps × 10 bands (9 + NDVI)
             channels_per_t = 10
             has_ndvi = True
+        elif channels == 45:
+            # 3 timesteps × 15 channels (9 raw bands + 6 indices).
+            # Raw bands still occupy positions 0–8 per window, so S2_TO_HLS_MAPPING
+            # indices (0,1,2,6,7,8) are unchanged — no adjustment needed.
+            channels_per_t = 15
+            has_ndvi = False
         else:
             raise ValueError(f"Unexpected channel count: {channels}")
 

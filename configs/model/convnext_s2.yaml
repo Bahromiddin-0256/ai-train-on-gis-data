@@ -5,7 +5,7 @@ _recursive_: false
 
 backbone: convnext_tiny
 
-in_channels: 30
+in_channels: 45
 
 num_classes: 3
 

@@ -24,12 +24,12 @@ echo ""
 
 # Step 1: Extract features
 echo "Step 1: Extracting features..."
-python scripts/extract_features.py \
-    --data-dir "$DATA_DIR" \
-    --output "$OUTPUT_DIR/features.csv" \
-    --n-windows 3 \
-    --bands "B02,B03,B04,B05,B06,B07,B08,B11,B12" \
-    --indices "ndvi,evi,ndwi,ndre,msi,nbr"
+#python scripts/extract_features.py \
+#    --data-dir "$DATA_DIR" \
+#    --output "$OUTPUT_DIR/features.csv" \
+#    --n-windows 3 \
+#    --bands "B02,B03,B04,B05,B06,B07,B08,B11,B12" \
+#    --indices "ndvi,evi,ndwi,ndre,msi,nbr"
 
 # Step 2: Train model
 echo ""

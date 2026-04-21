@@ -253,7 +253,8 @@ def _extract_chip(
 @click.option(
     "--indices",
     type=str,
-    default=None,
+    default="ndvi,evi,ndwi,ndre,msi,nbr",
+    show_default=True,
     help="Comma-separated indices to append as extra channels (e.g., 'ndvi,ndre').",
 )
 def main(

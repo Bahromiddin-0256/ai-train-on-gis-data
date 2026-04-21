@@ -356,6 +356,13 @@ def cross_validate(
     default=50,
     help="Early stopping rounds (default: 50)",
 )
+@click.option(
+    "--device",
+    type=click.Choice(["cuda", "cpu"]),
+    default="cuda",
+    show_default=True,
+    help="Device for XGBoost tree building (cuda uses GPU).",
+)
 def main(
     features: Path,
     output_dir: Path,
@@ -376,6 +383,7 @@ def main(
     cv_folds: int,
     seed: int,
     early_stopping: int,
+    device: str,
 ) -> None:
     """Train XGBoost model on extracted features."""
     output_dir = Path(output_dir)

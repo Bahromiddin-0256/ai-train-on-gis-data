@@ -149,7 +149,7 @@ def _combine(processed_base: Path, out: Path) -> None:
               default="2025-04-01:2025-05-31,2025-06-01:2025-07-31,2025-08-01:2025-09-30",
               show_default=True,
               help="Comma-separated 'start:end' date window pairs for multi-temporal extraction.")
-@click.option("--indices", type=str, default="ndvi", show_default=True,
+@click.option("--indices", type=str, default="ndvi,evi,ndwi,ndre,msi,nbr", show_default=True,
               help="Comma-separated indices to compute (e.g. ndvi,ndre).")
 @click.option("--labels-dir", type=Path, default=Path("data/labels"), show_default=True,
               help="Directory for per-tuman GeoJSON files.")

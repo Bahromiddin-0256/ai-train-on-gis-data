@@ -6,7 +6,7 @@ _target_: gis_train.models.classifier.CropClassifier
 _recursive_: false
 
 backbone: resnet50
-in_channels: 30
+in_channels: 45
 num_classes: 3
 pretrained: true
 

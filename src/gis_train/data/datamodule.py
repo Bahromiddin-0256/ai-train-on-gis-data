@@ -83,6 +83,7 @@ class CropDataModule(pl.LightningDataModule):
         date_end: str = "2021-10-31",
         cloud_cover_max: float = 20.0,
         bands: Sequence[str] = ("B02", "B03", "B04", "B08"),
+        indices: Sequence[str] = ("ndvi", "evi", "ndwi", "ndre", "msi", "nbr"),
         mean: Sequence[float] = (0.1354, 0.1118, 0.1042, 0.3033),
         std: Sequence[float] = (0.0605, 0.0621, 0.0754, 0.1082),
         image_size: int = 64,
@@ -116,6 +117,7 @@ class CropDataModule(pl.LightningDataModule):
         self.date_end = date_end
         self.cloud_cover_max = cloud_cover_max
         self.bands = tuple(bands)
+        self.indices = tuple(indices)
         self.mean = tuple(mean)
         self.std = tuple(std)
         self.image_size = image_size
@@ -145,7 +147,7 @@ class CropDataModule(pl.LightningDataModule):
 
     @property
     def num_bands(self) -> int:
-        return len(self.bands)
+        return len(self.bands) + len(self.indices)
 
     # ------------------------------------------------------------------
     # Lightning hooks

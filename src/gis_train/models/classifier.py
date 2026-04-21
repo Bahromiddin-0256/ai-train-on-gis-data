@@ -112,6 +112,26 @@ def _build_backbone(name: str, in_channels: int, pretrained: bool) -> tuple[nn.M
                                         new_conv.weight[:, start + len(_S2_WORKING_9)] = (
                                             pretrained_w[:, _S2_B08_IDX_IN_13] * scale
                                         )
+                                    elif n_ch_detected == len(_S2_WORKING_9) + 6:
+                                        # 9 raw bands + 6 indices (NDVI,EVI,NDWI,NDRE,MSI,NBR)
+                                        new_conv.weight[:, start:start + 9] = (
+                                            pretrained_w[:, _S2_WORKING_BAND_INDICES] * scale
+                                        )
+                                        # Warm-init each index from mean of its constituent bands.
+                                        # Pretrained band order (_S2_ALL_BANDS):
+                                        #   B02=1, B03=2, B04=3, B05=4, B08=7, B11=11, B12=12
+                                        _idx_src = [
+                                            [7, 3],      # NDVI  ← B08, B04
+                                            [7, 3, 1],   # EVI   ← B08, B04, B02
+                                            [7, 2],      # NDWI  ← B08, B03
+                                            [7, 4],      # NDRE  ← B08, B05
+                                            [11, 7],     # MSI   ← B11, B08
+                                            [7, 12],     # NBR   ← B08, B12
+                                        ]
+                                        for off, src in enumerate(_idx_src):
+                                            new_conv.weight[:, start + 9 + off] = (
+                                                pretrained_w[:, src].mean(dim=1) * scale
+                                            )
                                     else:
                                         nn.init.kaiming_normal_(
                                             new_conv.weight[:, start:start + n_ch_detected],

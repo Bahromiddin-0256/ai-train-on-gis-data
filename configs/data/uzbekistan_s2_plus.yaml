@@ -1,8 +1,7 @@
 # Richer Uzbekistan-S2 data config: Mixup/CutMix, temporal+band dropout.
 #
-# Channel layout still assumes 3 windows × 10 ch/window (9 bands + NDVI) = 30.
-# Swap to richer index packs by rerunning scripts/build_dataset.py with
-# --indices ndvi,ndre,ndwi,ndmi and updating channels_per_window accordingly.
+# Channel layout: 3 windows × 15 ch/window (9 bands + 6 indices) = 45 total.
+# Indices: ndvi,evi,ndwi,ndre,msi,nbr — set via build_dataset.py --indices.
 
 defaults:
   - uzbekistan_s2
