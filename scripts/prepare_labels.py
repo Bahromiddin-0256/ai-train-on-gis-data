@@ -20,6 +20,8 @@ Multi-temporal mode (``--date-windows``):
 
 from __future__ import annotations
 
+import time
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 import click
@@ -28,6 +30,92 @@ import numpy as np
 from gis_train.utils.logging import get_logger
 
 _log = get_logger(__name__)
+
+
+def _extract_record_local(
+    record: tuple[int, bytes | None, int | None],
+    scene_index: list[dict],
+    chip_size: int,
+    min_pixels: int,
+    retries: int,
+    retry_backoff: float,
+) -> tuple[int, str, np.ndarray | None, int | None]:
+    """Extract one polygon chip and return (idx, status, chip, label)."""
+    from shapely import wkb
+
+    idx, geom_wkb, label_idx = record
+    if geom_wkb is None or label_idx is None:
+        return idx, "no_label", None, None
+
+    geom = wkb.loads(geom_wkb)
+    gb = geom.bounds
+    candidates = []
+    for scene in scene_index:
+        sb = scene["bounds_wgs84"]
+        if gb[2] < sb[0] or gb[0] > sb[2] or gb[3] < sb[1] or gb[1] > sb[3]:
+            continue
+        candidates.append(scene)
+
+    if not candidates:
+        return idx, "no_scene", None, None
+
+    for scene in candidates:
+        delay = retry_backoff
+        for attempt in range(retries + 1):
+            try:
+                chip = _extract_chip(scene, geom, chip_size=chip_size, min_native_px=min_pixels)
+                if chip is not None:
+                    return idx, "ok", chip, label_idx
+                break
+            except Exception:
+                if attempt >= retries:
+                    break
+                time.sleep(delay)
+                delay *= 2
+
+    return idx, "too_small", None, None
+
+
+def _process_local_chunk(
+    records: list[tuple[int, bytes | None, int | None]],
+    scene_index: list[dict],
+    chip_size: int,
+    min_pixels: int,
+    num_threads: int,
+    retries: int,
+    retry_backoff: float,
+) -> list[tuple[int, str, np.ndarray | None, int | None]]:
+    """Process a list of polygon records, optionally using threads per process."""
+    if num_threads <= 1:
+        return [
+            _extract_record_local(
+                rec,
+                scene_index=scene_index,
+                chip_size=chip_size,
+                min_pixels=min_pixels,
+                retries=retries,
+                retry_backoff=retry_backoff,
+            )
+            for rec in records
+        ]
+
+    out: list[tuple[int, str, np.ndarray | None, int | None]] = []
+    with ThreadPoolExecutor(max_workers=num_threads) as pool:
+        futures = {
+            pool.submit(
+                _extract_record_local,
+                rec,
+                scene_index,
+                chip_size,
+                min_pixels,
+                retries,
+                retry_backoff,
+            ): rec[0]
+            for rec in records
+        }
+        for future in as_completed(futures):
+            out.append(future.result())
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -257,6 +345,34 @@ def _extract_chip(
     show_default=True,
     help="Comma-separated indices to append as extra channels (e.g., 'ndvi,ndre').",
 )
+@click.option(
+    "--num-proc",
+    type=int,
+    default=1,
+    show_default=True,
+    help="Number of extraction processes for local-tile mode.",
+)
+@click.option(
+    "--num-threads",
+    type=int,
+    default=1,
+    show_default=True,
+    help="Threads per process for local-tile mode.",
+)
+@click.option(
+    "--retries",
+    type=int,
+    default=2,
+    show_default=True,
+    help="Retries for transient per-polygon extraction errors.",
+)
+@click.option(
+    "--retry-backoff",
+    type=float,
+    default=0.5,
+    show_default=True,
+    help="Initial retry backoff in seconds (doubles per retry).",
+)
 def main(
     tiles_dir: Path | None,
     vectors: Path,
@@ -270,6 +386,10 @@ def main(
     bands: str,
     date_windows: str | None,
     indices: str | None,
+    num_proc: int,
+    num_threads: int,
+    retries: int,
+    retry_backoff: float,
 ) -> None:
     """Produce images.npy + labels.npy using polygon-level chips (one chip per field).
 
@@ -376,47 +496,66 @@ def main(
         _log.info("grouped into %d scenes", len(scene_groups))
         scene_index = _build_scene_index(scene_groups)
 
-        images: list[np.ndarray] = []
-        labels: list[int] = []
-        skipped_no_scene = 0
-        skipped_small = 0
-        skipped_label = 0
+        if num_proc < 1:
+            raise click.UsageError("--num-proc must be >= 1")
+        if num_threads < 1:
+            raise click.UsageError("--num-threads must be >= 1")
+        if retries < 0:
+            raise click.UsageError("--retries must be >= 0")
+        if retry_backoff < 0:
+            raise click.UsageError("--retry-backoff must be >= 0")
 
-        for _, row in tqdm(gdf.iterrows(), total=len(gdf), desc="extracting chips", unit="poly"):
+        records: list[tuple[int, bytes | None, int | None]] = []
+        for idx, row in gdf.iterrows():
             geom = row.geometry
             label_str = row.get(class_field)
+            label_idx = class_to_idx.get(label_str)
+            geom_wkb = None
+            if geom is not None and not geom.is_empty:
+                geom_wkb = bytes(geom.wkb)
+            records.append((int(idx), geom_wkb, label_idx))
 
-            if geom is None or geom.is_empty:
-                skipped_label += 1
-                continue
-            if label_str not in class_to_idx:
-                skipped_label += 1
-                continue
+        results: list[tuple[int, str, np.ndarray | None, int | None]] = []
+        if num_proc == 1:
+            results = _process_local_chunk(
+                records=records,
+                scene_index=scene_index,
+                chip_size=chip_size,
+                min_pixels=min_pixels,
+                num_threads=num_threads,
+                retries=retries,
+                retry_backoff=retry_backoff,
+            )
+        else:
+            chunk_count = min(num_proc, max(1, len(records)))
+            chunks: list[list[tuple[int, bytes | None, int | None]]] = [
+                records[i::chunk_count] for i in range(chunk_count)
+            ]
+            with ProcessPoolExecutor(max_workers=chunk_count) as pool:
+                futures = [
+                    pool.submit(
+                        _process_local_chunk,
+                        chunk,
+                        scene_index,
+                        chip_size,
+                        min_pixels,
+                        num_threads,
+                        retries,
+                        retry_backoff,
+                    )
+                    for chunk in chunks
+                    if chunk
+                ]
+                for future in tqdm(as_completed(futures), total=len(futures), desc="chunks", unit="chunk"):
+                    results.extend(future.result())
 
-            gb = geom.bounds
-            chip = None
-            for scene in scene_index:
-                sb = scene["bounds_wgs84"]
-                if gb[2] < sb[0] or gb[0] > sb[2] or gb[3] < sb[1] or gb[1] > sb[3]:
-                    continue
-                chip = _extract_chip(scene, geom, chip_size=chip_size, min_native_px=min_pixels)
-                if chip is not None:
-                    break
+        results.sort(key=lambda x: x[0])
 
-            if chip is None:
-                covered = any(
-                    not (gb[2] < s["bounds_wgs84"][0] or gb[0] > s["bounds_wgs84"][2]
-                         or gb[3] < s["bounds_wgs84"][1] or gb[1] > s["bounds_wgs84"][3])
-                    for s in scene_index
-                )
-                if covered:
-                    skipped_small += 1
-                else:
-                    skipped_no_scene += 1
-                continue
-
-            images.append(chip)
-            labels.append(class_to_idx[label_str])
+        images = [chip for _, status, chip, _ in results if status == "ok" and chip is not None]
+        labels = [label for _, status, _, label in results if status == "ok" and label is not None]
+        skipped_no_scene = sum(1 for _, status, _, _ in results if status == "no_scene")
+        skipped_small = sum(1 for _, status, _, _ in results if status == "too_small")
+        skipped_label = sum(1 for _, status, _, _ in results if status == "no_label")
 
         if not images:
             raise RuntimeError("no chips produced — check tiles-dir and vectors overlap")

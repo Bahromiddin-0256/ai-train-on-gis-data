@@ -53,7 +53,9 @@ if [ -n "$VECTORS" ] && [ -f "$VECTORS" ]; then
         --bands "$BANDS" \
         --date-windows "$DATE_WINDOWS" \
         --indices "$INDICES" \
-        --out "$OUTPUT_DIR"
+        --out "$OUTPUT_DIR" \
+        --num-proc 16 \
+        --num-threads 4
 else
     echo "Step 1: Running full regional pipeline (build_dataset.py)..."
     python scripts/build_dataset.py \
