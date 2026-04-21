@@ -337,18 +337,28 @@ class CropClassifier(pl.LightningModule):
             "weight_decay": 1.0e-4,
         }
         base_lr = float(opt_cfg.get("lr", 1.0e-4)) if hasattr(opt_cfg, "get") else 1.0e-4
-        optimizer: Optimizer = instantiate(opt_cfg, params=self._param_groups(base_lr))
+        
+        # Instantiate optimizer without Hydra wrapping the params list into ListConfig
+        from hydra.utils import get_class
+        if isinstance(opt_cfg, dict):
+            opt_class = get_class(opt_cfg["_target_"])
+            opt_kwargs = {k: v for k, v in opt_cfg.items() if k != "_target_"}
+        else:
+            opt_class = get_class(opt_cfg._target_)
+            opt_kwargs = {k: v for k, v in opt_cfg.items() if k != "_target_"}
+            
+        optimizer: Optimizer = opt_class(self._param_groups(base_lr), **opt_kwargs)
 
         if self._scheduler_cfg is None and self._warmup_epochs <= 0:
             return optimizer
 
         if self._warmup_epochs > 0:
             warmup = self._warmup_epochs
-            main_scheduler: LRScheduler | None = (
-                instantiate(self._scheduler_cfg, optimizer=optimizer)
-                if self._scheduler_cfg is not None
-                else None
-            )
+            main_scheduler: LRScheduler | None = None
+            if self._scheduler_cfg is not None:
+                sched_class = get_class(self._scheduler_cfg._target_) if not isinstance(self._scheduler_cfg, dict) else get_class(self._scheduler_cfg["_target_"])
+                sched_kwargs = {k: v for k, v in self._scheduler_cfg.items() if k != "_target_"}
+                main_scheduler = sched_class(optimizer, **sched_kwargs)
 
             def lr_lambda(epoch: int) -> float:
                 if epoch < warmup:
@@ -365,5 +375,7 @@ class CropClassifier(pl.LightningModule):
             )
             return {"optimizer": optimizer, "lr_scheduler": sched}
 
-        scheduler: LRScheduler = instantiate(self._scheduler_cfg, optimizer=optimizer)
+        sched_class = get_class(self._scheduler_cfg._target_) if not isinstance(self._scheduler_cfg, dict) else get_class(self._scheduler_cfg["_target_"])
+        sched_kwargs = {k: v for k, v in self._scheduler_cfg.items() if k != "_target_"}
+        scheduler: LRScheduler = sched_class(optimizer, **sched_kwargs)
         return {"optimizer": optimizer, "lr_scheduler": scheduler}
