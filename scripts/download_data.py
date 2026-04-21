@@ -16,7 +16,10 @@ Example::
 
 from __future__ import annotations
 
+import json
 import os
+from concurrent.futures import ProcessPoolExecutor, as_completed
+from datetime import date, datetime, timedelta
 from pathlib import Path
 
 import click
@@ -38,6 +41,71 @@ _AOI_PRESETS: dict[str, BBox] = {
 def _parse_bbox(value: str) -> BBox:
     parts = [float(x) for x in value.split(",")]
     return bbox_from_sequence(parts)
+
+
+def _split_date_range(date_start: str, date_end: str, parts: int) -> list[tuple[str, str]]:
+    start = date.fromisoformat(date_start)
+    end = date.fromisoformat(date_end)
+    if end < start:
+        raise click.BadParameter("--date-end must be >= --date-start")
+
+    total_days = (end - start).days + 1
+    parts = max(1, min(parts, total_days))
+
+    base = total_days // parts
+    rem = total_days % parts
+    ranges: list[tuple[str, str]] = []
+
+    cursor = start
+    for i in range(parts):
+        length = base + (1 if i < rem else 0)
+        chunk_end = cursor + timedelta(days=length - 1)
+        ranges.append((cursor.isoformat(), chunk_end.isoformat()))
+        cursor = chunk_end + timedelta(days=1)
+
+    return ranges
+
+
+def _write_checkpoint(path: Path, payload: dict) -> None:
+    tmp = path.with_suffix(".tmp")
+    tmp.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
+    tmp.replace(path)
+
+
+def _load_checkpoint(path: Path) -> dict | None:
+    if not path.exists():
+        return None
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+
+
+def _download_chunk_worker(
+    *,
+    bbox_tuple: tuple[float, float, float, float],
+    date_start: str,
+    date_end: str,
+    out_dir: str,
+    bands: list[str],
+    cloud_cover_max: float,
+    limit: int | None,
+    clip: bool,
+    threads_per_process: int,
+) -> tuple[int, int]:
+    bbox_obj = BBox(*bbox_tuple)
+    result = download_sentinel2_l2a(
+        bbox=bbox_obj,
+        date_start=date_start,
+        date_end=date_end,
+        out_dir=Path(out_dir),
+        bands=bands,
+        cloud_cover_max=cloud_cover_max,
+        limit=limit,
+        clip=clip,
+        max_workers=threads_per_process,
+    )
+    return result.scenes, result.assets
 
 
 @click.command()
@@ -96,6 +164,19 @@ def _parse_bbox(value: str) -> BBox:
     help="Parallel download threads (default: min(8, CPU count)).",
 )
 @click.option(
+    "--processes",
+    type=int,
+    default=1,
+    show_default=True,
+    help="Download processes for date-range chunking.",
+)
+@click.option(
+    "--resume/--no-resume",
+    default=True,
+    show_default=True,
+    help="Resume chunked downloads from checkpoint on retry.",
+)
+@click.option(
     "--dry-run",
     is_flag=True,
     default=False,
@@ -137,6 +218,8 @@ def main(
     out: Path,
     no_clip: bool,
     workers: int | None,
+    processes: int,
+    resume: bool,
     dry_run: bool,
     compute_indices: bool,
     composite: str,
@@ -149,17 +232,20 @@ def main(
         raise click.BadParameter("At least one band must be specified.", param_hint="--bands")
 
     bbox_obj = _parse_bbox(bbox) if bbox else _AOI_PRESETS[aoi]
-    effective_workers = workers if workers is not None else min(8, os.cpu_count() or 4)
+    threads_per_process = workers if workers is not None else min(8, os.cpu_count() or 4)
+    if processes < 1:
+        raise click.BadParameter("--processes must be >= 1", param_hint="--processes")
 
     _log.info("Date range: %s → %s", date_start, date_end)
     _log.info("Cloud cover max: %s%%", cloud_cover_max)
     _log.info(
-        "AOI=%s bbox=%s bands=%s clip=%s workers=%d",
+        "AOI=%s bbox=%s bands=%s clip=%s processes=%d threads/process=%d",
         aoi if not bbox else "custom",
         bbox_obj.as_tuple(),
         band_list,
         not no_clip,
-        effective_workers,
+        processes,
+        threads_per_process,
     )
 
     if dry_run:
@@ -180,20 +266,94 @@ def main(
                    f" → {items[0].datetime.date() if items else '—'}")
         return
 
-    result = download_sentinel2_l2a(
-        bbox=bbox_obj,
-        date_start=date_start,
-        date_end=date_end,
-        out_dir=out,
-        bands=band_list,
-        cloud_cover_max=cloud_cover_max,
-        limit=limit,
-        clip=not no_clip,
-        max_workers=effective_workers,
-    )
-    click.echo(
-        f"Downloaded {result.assets} assets across {result.scenes} scenes -> {result.out_dir}"
-    )
+    out.mkdir(parents=True, exist_ok=True)
+
+    if processes == 1:
+        result = download_sentinel2_l2a(
+            bbox=bbox_obj,
+            date_start=date_start,
+            date_end=date_end,
+            out_dir=out,
+            bands=band_list,
+            cloud_cover_max=cloud_cover_max,
+            limit=limit,
+            clip=not no_clip,
+            max_workers=threads_per_process,
+        )
+        click.echo(
+            f"Downloaded {result.assets} assets across {result.scenes} scenes -> {result.out_dir}"
+        )
+    else:
+        chunks = _split_date_range(date_start, date_end, processes)
+        checkpoint_path = out / ".download_chunks_checkpoint.json"
+        checkpoint_sig = {
+            "bbox": bbox_obj.as_tuple(),
+            "date_start": date_start,
+            "date_end": date_end,
+            "bands": band_list,
+            "cloud_cover_max": cloud_cover_max,
+            "limit": limit,
+            "clip": not no_clip,
+            "processes": len(chunks),
+            "threads_per_process": threads_per_process,
+        }
+
+        completed: set[int] = set()
+        if resume:
+            prior = _load_checkpoint(checkpoint_path)
+            if prior and prior.get("signature") == checkpoint_sig:
+                completed = {int(i) for i in prior.get("completed", [])}
+                _log.info("Resuming: %d/%d chunks already completed", len(completed), len(chunks))
+
+        pending = [
+            (idx, chunk_start, chunk_end)
+            for idx, (chunk_start, chunk_end) in enumerate(chunks)
+            if idx not in completed
+        ]
+
+        total_scenes = 0
+        total_assets = 0
+        if not pending:
+            _log.info("All chunks already completed per checkpoint")
+        else:
+            with ProcessPoolExecutor(max_workers=len(chunks)) as pool:
+                futures = {
+                    pool.submit(
+                        _download_chunk_worker,
+                        bbox_tuple=bbox_obj.as_tuple(),
+                        date_start=chunk_start,
+                        date_end=chunk_end,
+                        out_dir=str(out),
+                        bands=band_list,
+                        cloud_cover_max=cloud_cover_max,
+                        limit=limit,
+                        clip=not no_clip,
+                        threads_per_process=threads_per_process,
+                    ): idx
+                    for idx, chunk_start, chunk_end in pending
+                }
+                for future in as_completed(futures):
+                    idx = futures[future]
+                    scenes, assets = future.result()
+                    total_scenes += scenes
+                    total_assets += assets
+                    completed.add(idx)
+                    if resume:
+                        _write_checkpoint(
+                            checkpoint_path,
+                            {
+                                "signature": checkpoint_sig,
+                                "completed": sorted(completed),
+                                "updated_at": datetime.utcnow().isoformat(timespec="seconds") + "Z",
+                            },
+                        )
+
+        if resume and len(completed) == len(chunks):
+            checkpoint_path.unlink(missing_ok=True)
+
+        click.echo(
+            f"Downloaded {total_assets} assets across {total_scenes} chunk-scenes -> {out}"
+        )
 
     if sar:
         from gis_train.data.download import download_sentinel1
@@ -203,7 +363,7 @@ def main(
             date_start=date_start,
             date_end=date_end,
             out_dir=sar_out,
-            max_workers=effective_workers,
+            max_workers=threads_per_process,
         )
         click.echo(
             f"SAR: downloaded {sar_result.assets} assets across"

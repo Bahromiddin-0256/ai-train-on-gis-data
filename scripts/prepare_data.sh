@@ -104,7 +104,9 @@ python scripts/extract_features.py \
     --output "$FEATURES_DIR/features.csv" \
     --n-windows "$N_WINDOWS" \
     --bands "$BANDS" \
-    --indices "$INDICES"
+    --indices "$INDICES" \
+    --workers 16 \
+    --processes 4
 
 echo ""
 echo "========================================"
