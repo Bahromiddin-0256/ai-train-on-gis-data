@@ -415,6 +415,7 @@ def main(
         "alpha": reg_alpha,
         "lambda": reg_lambda,
         "tree_method": "hist",
+        "device": device,
         "random_state": seed,
         "seed": seed,
     }

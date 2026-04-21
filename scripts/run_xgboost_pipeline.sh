@@ -47,7 +47,8 @@ python scripts/train_xgboost.py \
     --min-child-weight 3 \
     --class-names "bugdoy,other,paxta" \
     --seed 42 \
-    --early-stopping 50
+    --early-stopping 50 \
+    --device cuda
 
 # Step 3: Evaluate
 echo ""
