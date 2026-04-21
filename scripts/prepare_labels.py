@@ -251,10 +251,10 @@ def _extract_chip(
     ),
 )
 @click.option(
-    "--add-ndvi",
-    is_flag=True,
-    default=True,
-    help="Append NDVI as an extra channel (used with --from-stac, default on).",
+    "--indices",
+    type=str,
+    default=None,
+    help="Comma-separated indices to append as extra channels (e.g., 'ndvi,ndre').",
 )
 def main(
     tiles_dir: Path | None,
@@ -268,7 +268,7 @@ def main(
     date_end: str,
     bands: str,
     date_windows: str | None,
-    add_ndvi: bool,
+    indices: str | None,
 ) -> None:
     """Produce images.npy + labels.npy using polygon-level chips (one chip per field).
 
@@ -298,6 +298,18 @@ def main(
     # -----------------------------------------------------------------------
     if from_stac:
         band_list = [b.strip() for b in bands.split(",") if b.strip()]
+        index_list = [i.strip() for i in indices.split(",")] if indices else None
+
+        if index_list:
+            from gis_train.data.indices import required_bands
+            req = required_bands(index_list)
+            missing = req - set(band_list)
+            if missing:
+                raise click.UsageError(
+                    f"Requested indices {index_list} require bands {req}, "
+                    f"but missing: {missing}"
+                )
+
         gdf["class_idx"] = gdf[class_field].map(class_to_idx)
         gdf = gdf[gdf["class_idx"].notna()].copy()
 
@@ -323,7 +335,7 @@ def main(
                 date_windows=windows,
                 chip_size=chip_size,
                 min_native_px=min_pixels,
-                add_ndvi=add_ndvi,
+                indices=index_list,
             )
         else:
             from gis_train.data.download import fetch_chips_from_stac

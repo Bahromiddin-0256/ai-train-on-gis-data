@@ -359,7 +359,7 @@ def _fetch_single_window_chips(
     chip_size: int,
     cloud_cover_max: float,
     min_native_px: int,
-    add_ndvi: bool,
+    indices: Sequence[str] | None,
     catalog,
 ) -> dict:
     """Extract chips for one time window. Returns {poly_idx: np.ndarray}.
@@ -526,13 +526,11 @@ def _fetch_single_window_chips(
                     resized_bands.append(r.squeeze(0).numpy())
                 chip = np.concatenate(resized_bands, axis=0)  # (C, chip_size, chip_size)
 
-                # Optionally append NDVI as an extra channel (computed from raw DN values)
-                if add_ndvi and "B08" in bands and "B04" in bands:
-                    b08 = chip[list(bands).index("B08")]
-                    b04 = chip[list(bands).index("B04")]
-                    ndvi_raw = (b08 - b04) / (b08 + b04 + 1e-3)  # [-1, 1]
-                    ndvi_dn = (ndvi_raw + 1.0) * 5000.0  # scale to [0, 10000]
-                    chip = np.concatenate([chip, ndvi_dn[np.newaxis]], axis=0)
+                # Compute and append additional spectral indices if requested
+                if indices:
+                    from gis_train.data.indices import compute_indices
+                    idx_arr = compute_indices(chip, list(bands), list(indices))
+                    chip = np.concatenate([chip, idx_arr], axis=0)
 
                 result[idx] = chip
         finally:
@@ -553,7 +551,7 @@ def fetch_chips_multitemporal(
     chip_size: int = 64,
     cloud_cover_max: float = 20.0,
     min_native_px: int = 4,
-    add_ndvi: bool = True,
+    indices: Sequence[str] | None = None,
     max_missing_windows: int = 1,
 ) -> tuple[list, list[int]]:
     """Fetch per-polygon chips across multiple time windows.
@@ -573,8 +571,8 @@ def fetch_chips_multitemporal(
         Sentinel-2 band IDs to fetch per window (e.g. ``["B02", "B03", "B04", "B08"]``).
     date_windows:
         Sequence of ``(date_start, date_end)`` pairs defining the time windows.
-    add_ndvi:
-        Append NDVI as an extra channel after the band channels for each window.
+    indices:
+        List of index names (e.g. 'ndvi', 'ndre') to append as extra channels for each window.
     max_missing_windows:
         Polygons with more than this many zero-padded windows are dropped.
     """
@@ -583,7 +581,7 @@ def fetch_chips_multitemporal(
 
     catalog = Client.open(_PC_STAC_URL)
 
-    n_channels_per_window = len(bands) + (1 if add_ndvi else 0)
+    n_channels_per_window = len(bands) + (len(indices) if indices else 0)
     zero_window = np.zeros((n_channels_per_window, chip_size, chip_size), dtype=np.float32)
 
     # Collect chips per window: list of {poly_idx: chip}
@@ -598,7 +596,7 @@ def fetch_chips_multitemporal(
             chip_size=chip_size,
             cloud_cover_max=cloud_cover_max,
             min_native_px=min_native_px,
-            add_ndvi=add_ndvi,
+            indices=indices,
             catalog=catalog,
         )
         window_results.append(window_chips)

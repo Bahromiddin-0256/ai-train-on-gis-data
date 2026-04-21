@@ -76,6 +76,7 @@ data/raw/
 data/processed/
 data/processed*
 data/tuman*
+data/labels/
 data/interim/
 data/external/
 data/*.tif

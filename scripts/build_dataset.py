@@ -149,8 +149,9 @@ def _combine(processed_base: Path, out: Path) -> None:
               default="2025-04-01:2025-05-31,2025-06-01:2025-07-31,2025-08-01:2025-09-30",
               show_default=True,
               help="Comma-separated 'start:end' date window pairs for multi-temporal extraction.")
-@click.option("--add-ndvi", is_flag=True, default=True,
-              help="Append NDVI as extra channel.")
+              help="Comma-separated 'start:end' date window pairs for multi-temporal extraction.")
+@click.option("--indices", type=str, default="ndvi", show_default=True,
+              help="Comma-separated indices to compute (e.g. ndvi,ndre).")
 @click.option("--labels-dir", type=Path, default=Path("data/labels"), show_default=True,
               help="Directory for per-tuman GeoJSON files.")
 @click.option("--processed-base", type=Path, default=Path("data"), show_default=True,
@@ -169,7 +170,7 @@ def main(
     per_class: int,
     bands: str,
     date_windows: str,
-    add_ndvi: bool,
+    indices: str,
     labels_dir: Path,
     processed_base: Path,
     out: Path,
@@ -274,8 +275,8 @@ def main(
             "--chip-size", "64",
             "--out", str(chips_dir),
         ]
-        if add_ndvi:
-            cmd.append("--add-ndvi")
+        if indices:
+            cmd.extend(["--indices", indices])
         result = subprocess.run(cmd)
         if result.returncode != 0:
             msg = f"prepare_labels.py failed for tuman_code={tcode}"
