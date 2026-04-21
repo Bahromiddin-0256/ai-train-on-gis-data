@@ -401,6 +401,11 @@ def main(
         random_state=seed,
     )
 
+    # Save test indices so evaluate_xgboost.py can restrict to the held-out set
+    test_indices_path = output_dir / "test_indices.npy"
+    np.save(str(test_indices_path), test_df.index.values)
+    click.echo(f"Saved test indices ({len(test_df)}) → {test_indices_path}")
+
     # XGBoost parameters
     params = {
         "objective": "multi:softprob" if num_class > 2 else "binary:logistic",

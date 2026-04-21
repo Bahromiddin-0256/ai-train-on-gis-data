@@ -145,6 +145,13 @@ def evaluate_model(
     help="Target column name (default: label)",
 )
 @click.option(
+    "--test-indices",
+    type=click.Path(path_type=Path),
+    default=None,
+    help="Path to test_indices.npy saved by train_xgboost.py. When provided, "
+         "evaluation is restricted to the held-out test set only (recommended).",
+)
+@click.option(
     "--save-predictions",
     is_flag=True,
     help="Save predictions to CSV",
@@ -155,6 +162,7 @@ def main(
     output_dir: Path | None,
     class_names: str,
     target_col: str,
+    test_indices: Path | None,
     save_predictions: bool,
 ) -> None:
     """Evaluate XGBoost model on features."""
@@ -173,6 +181,16 @@ def main(
     # Load data
     click.echo(f"Loading features from {features_path}...")
     df = pd.read_csv(features_path)
+
+    if test_indices is not None:
+        idx = np.load(str(test_indices))
+        df = df.iloc[idx].reset_index(drop=True)
+        click.echo(f"Restricting to test split: {len(df)} samples (test_indices.npy)")
+    else:
+        click.echo(
+            "WARNING: --test-indices not provided. Evaluating on ALL samples "
+            "(includes training data — metrics will be inflated)."
+        )
 
     feature_cols = [c for c in df.columns if c != target_col]
     features = df[feature_cols].values

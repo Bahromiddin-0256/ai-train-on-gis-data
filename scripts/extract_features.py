@@ -174,6 +174,7 @@ def extract_temporal_features(
     patch: np.ndarray,
     n_windows: int,
     bands_per_window: int,
+    aug_bands: list[str] | None = None,
 ) -> dict[str, float]:
     """Temporal change features between consecutive time windows."""
     C, H, W = patch.shape
@@ -182,7 +183,7 @@ def extract_temporal_features(
 
     for b in range(bands_per_window):
         means = reshaped[:, b].mean(axis=(1, 2))
-        bn = f"band{b}"
+        bn = aug_bands[b] if aug_bands else f"band{b}"
         features[f"{bn}_change_w0w1"] = float(means[1] - means[0])
         features[f"{bn}_change_w1w2"] = float(means[2] - means[1]) if n_windows > 2 else 0.0
         features[f"{bn}_total_change"] = float(means[-1] - means[0])
@@ -251,7 +252,7 @@ def extract_features(
         aug_patch, _ = augment_with_indices(patch, raw_bands, n_windows, index_names or [])
 
         features = extract_features_from_patch(aug_patch, all_band_names)
-        temporal = extract_temporal_features(aug_patch, n_windows, len(aug_bands))
+        temporal = extract_temporal_features(aug_patch, n_windows, len(aug_bands), aug_bands=aug_bands)
         ndvi_stats = compute_ndvi_temporal_stats(aug_patch, all_band_names)
 
         features.update(temporal)

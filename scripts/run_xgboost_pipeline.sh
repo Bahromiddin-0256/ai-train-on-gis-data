@@ -56,6 +56,7 @@ echo "Step 3: Generating detailed evaluation..."
 python scripts/evaluate_xgboost.py \
     --model "$OUTPUT_DIR/xgboost_model.json" \
     --features "$OUTPUT_DIR/features.csv" \
+    --test-indices "$OUTPUT_DIR/test_indices.npy" \
     --output-dir "$OUTPUT_DIR" \
     --class-names "bugdoy,other,paxta" \
     --save-predictions
