@@ -163,6 +163,92 @@ def _clip_tif_to_bbox(src_path: Path, dst_path: Path, bbox: BBox) -> None:
     )
 
 
+def _extract_scene_chips(
+    scene_id: str,
+    poly_indices: list[int],
+    hrefs: dict[str, str],
+    gdf,
+    bands: Sequence[str],
+    chip_size: int,
+    min_native_px: int,
+) -> tuple[list[np.ndarray], list[int], int]:
+    """Extract chips for all polygons in a single scene.
+
+    Returns (chips, labels, skipped_small_count).
+    """
+    import numpy as np
+    import torch
+    import torch.nn.functional as F
+    from pyproj import Transformer
+    from rasterio.windows import from_bounds
+
+    import rasterio
+
+    def _read_window_from_src(src, geom) -> np.ndarray | None:
+        nb = src.bounds
+        if src.crs.to_epsg() == 4326:
+            bx0, by0, bx1, by1 = geom.bounds
+        else:
+            t = Transformer.from_crs("EPSG:4326", src.crs, always_xy=True)
+            b = geom.bounds
+            corners = [
+                t.transform(b[0], b[1]), t.transform(b[2], b[1]),
+                t.transform(b[0], b[3]), t.transform(b[2], b[3]),
+            ]
+            xs, ys = zip(*corners)
+            bx0, bx1 = min(xs), max(xs)
+            by0, by1 = min(ys), max(ys)
+        bx0 = max(bx0, nb.left)
+        by0 = max(by0, nb.bottom)
+        bx1 = min(bx1, nb.right)
+        by1 = min(by1, nb.top)
+        if bx0 >= bx1 or by0 >= by1:
+            return None
+        win = from_bounds(bx0, by0, bx1, by1, src.transform)
+        return src.read(window=win)
+
+    chips: list[np.ndarray] = []
+    labels: list[int] = []
+    skipped_small = 0
+
+    try:
+        band_srcs = [rasterio.open(hrefs[b]) for b in bands]
+    except Exception as exc:
+        _log.warning("Cannot open scene %s: %s", scene_id, exc)
+        return chips, labels, skipped_small
+
+    try:
+        for idx in poly_indices:
+            row = gdf.loc[idx]
+            geom = row.geometry
+
+            band_arrays: list[np.ndarray] = []
+            ok = True
+            for src in band_srcs:
+                arr = _read_window_from_src(src, geom)
+                if arr is None or arr.shape[1] < min_native_px or arr.shape[2] < min_native_px:
+                    ok = False
+                    skipped_small += 1
+                    break
+                band_arrays.append(arr)
+
+            if not ok:
+                continue
+
+            stacked = np.concatenate(band_arrays, axis=0).astype(np.float32)
+            t = torch.from_numpy(stacked).unsqueeze(0)
+            resized = F.interpolate(
+                t, size=(chip_size, chip_size), mode="bilinear", align_corners=False
+            )
+            chips.append(resized.squeeze(0).numpy())
+            labels.append(int(row["class_idx"]))
+    finally:
+        for src in band_srcs:
+            src.close()
+
+    return chips, labels, skipped_small
+
+
 def fetch_chips_from_stac(
     gdf,
     bands: Sequence[str],
@@ -171,6 +257,8 @@ def fetch_chips_from_stac(
     chip_size: int = 64,
     cloud_cover_max: float = 20.0,
     min_native_px: int = 4,
+    num_proc: int = 1,
+    num_threads: int = 1,
 ) -> tuple[list, list[int]]:
     """Read per-polygon chips directly from Planetary Computer COGs (no tile download).
 
@@ -187,6 +275,10 @@ def fetch_chips_from_stac(
     ----------
     gdf:
         GeoDataFrame in EPSG:4326.  Must have a ``class_idx`` integer column.
+    num_proc:
+        Number of processes for parallel scene processing (default: 1).
+    num_threads:
+        Number of threads per process for parallel polygon extraction (default: 1).
     """
     from collections import defaultdict
 
@@ -299,50 +391,57 @@ def fetch_chips_from_stac(
     labels: list[int] = []
     skipped_small = 0
 
-    for scene_id, poly_indices in tqdm(
-        scene_to_polys.items(), desc="scenes", unit="scene"
-    ):
+    # Prepare scene data for parallel processing
+    scene_data = []
+    for scene_id, poly_indices in scene_to_polys.items():
         item = scene_items[scene_id]
         signed = planetary_computer.sign(item)
         hrefs = {b: signed.assets[b].href for b in bands if b in signed.assets}
         if len(hrefs) < len(bands):
             continue
+        scene_data.append((scene_id, poly_indices, hrefs))
 
-        # Open all band COGs for this scene at once
-        try:
-            band_srcs = [rasterio.open(hrefs[b]) for b in bands]
-        except Exception as exc:
-            _log.warning("Cannot open scene %s: %s", scene_id, exc)
-            continue
+    if num_threads <= 1:
+        # Sequential processing
+        for scene_id, poly_indices, hrefs in tqdm(scene_data, desc="scenes", unit="scene"):
+            scene_chips, scene_labels, scene_skipped = _extract_scene_chips(
+                scene_id=scene_id,
+                poly_indices=poly_indices,
+                hrefs=hrefs,
+                gdf=gdf,
+                bands=bands,
+                chip_size=chip_size,
+                min_native_px=min_native_px,
+            )
+            chips.extend(scene_chips)
+            labels.extend(scene_labels)
+            skipped_small += scene_skipped
+    else:
+        # Thread-parallel processing across scenes
+        import threading
 
-        try:
-            for idx in tqdm(poly_indices, desc=f"  {scene_id[:28]}", unit="poly", leave=False):
-                row = gdf.loc[idx]
-                geom = row.geometry
+        chips_lock = threading.Lock()
 
-                band_arrays: list[np.ndarray] = []
-                ok = True
-                for src in band_srcs:
-                    arr = _read_window_from_src(src, geom)
-                    if arr is None or arr.shape[1] < min_native_px or arr.shape[2] < min_native_px:
-                        ok = False
-                        skipped_small += 1
-                        break
-                    band_arrays.append(arr)
+        def _process_scene_thread(args):
+            scene_id, poly_indices, hrefs = args
+            return _extract_scene_chips(
+                scene_id=scene_id,
+                poly_indices=poly_indices,
+                hrefs=hrefs,
+                gdf=gdf,
+                bands=bands,
+                chip_size=chip_size,
+                min_native_px=min_native_px,
+            )
 
-                if not ok:
-                    continue
-
-                stacked = np.concatenate(band_arrays, axis=0).astype(np.float32)
-                t = torch.from_numpy(stacked).unsqueeze(0)
-                resized = F.interpolate(
-                    t, size=(chip_size, chip_size), mode="bilinear", align_corners=False
-                )
-                chips.append(resized.squeeze(0).numpy())
-                labels.append(int(row["class_idx"]))
-        finally:
-            for src in band_srcs:
-                src.close()
+        with ThreadPoolExecutor(max_workers=num_threads) as pool:
+            futures = {pool.submit(_process_scene_thread, sd): sd[0] for sd in scene_data}
+            for future in tqdm(as_completed(futures), total=len(futures), desc="scenes", unit="scene"):
+                scene_chips, scene_labels, scene_skipped = future.result()
+                with chips_lock:
+                    chips.extend(scene_chips)
+                    labels.extend(scene_labels)
+                    skipped_small += scene_skipped
 
     _log.info(
         "Done: %d chips (skipped %d no-scene, %d too-small)",
@@ -361,6 +460,7 @@ def _fetch_single_window_chips(
     min_native_px: int,
     indices: Sequence[str] | None,
     catalog,
+    num_threads: int = 1,
 ) -> dict:
     """Extract chips for one time window. Returns {poly_idx: np.ndarray}.
 
@@ -370,6 +470,11 @@ def _fetch_single_window_chips(
     - Does NOT require class_idx column (handled by caller).
     - Skips min_native_px check for 20m-resolution bands (identified by
       src.res[0] > 0.00015 degrees, since 10m ~ 0.0001 deg, 20m ~ 0.0002 deg).
+
+    Parameters
+    ----------
+    num_threads:
+        Number of threads for parallel polygon extraction (default: 1).
     """
     from collections import defaultdict
 
@@ -451,7 +556,7 @@ def _fetch_single_window_chips(
         scene_to_polys[scene_id].append(idx)
 
     # ------------------------------------------------------------------
-    # Step 4: per-scene windowed reads — open each COG once
+    # Step 4: per-scene windowed reads with optional thread parallelism
     # ------------------------------------------------------------------
     def _read_window_from_src(src, geom) -> np.ndarray | None:
         nb = src.bounds
@@ -474,26 +579,23 @@ def _fetch_single_window_chips(
         win = from_bounds(bx0, by0, bx1, by1, src.transform)
         return src.read(window=win)
 
-    result: dict[int, np.ndarray] = {}
-    skipped_small = 0
-
-    for scene_id, poly_indices in tqdm(
-        scene_to_polys.items(), desc="scenes", unit="scene"
-    ):
-        item = scene_items[scene_id]
-        signed = planetary_computer.sign(item)
-        hrefs = {b: signed.assets[b].href for b in bands if b in signed.assets}
-        if len(hrefs) < len(bands):
-            continue
+    def _extract_single_scene(
+        scene_id: str,
+        poly_indices: list[int],
+        hrefs: dict[str, str],
+    ) -> tuple[dict[int, np.ndarray], int]:
+        """Extract chips for all polygons in one scene. Returns ({poly_idx: chip}, skipped_count)."""
+        result: dict[int, np.ndarray] = {}
+        skipped_small = 0
 
         try:
             band_srcs = [rasterio.open(hrefs[b]) for b in bands]
         except Exception as exc:
             _log.warning("Cannot open scene %s: %s", scene_id, exc)
-            continue
+            return result, skipped_small
 
         try:
-            for idx in tqdm(poly_indices, desc=f"  {scene_id[:28]}", unit="poly", leave=False):
+            for idx in poly_indices:
                 row = gdf.loc[idx]
                 geom = row.geometry
 
@@ -506,7 +608,6 @@ def _fetch_single_window_chips(
                         skipped_small += 1
                         break
                     # For 20m bands (res[0] > 0.00015 deg), skip min_native_px check
-                    # since F.interpolate will resize to chip_size anyway.
                     is_20m = src.res[0] > 0.00015
                     if not is_20m and (arr.shape[1] < min_native_px or arr.shape[2] < min_native_px):
                         ok = False
@@ -517,14 +618,13 @@ def _fetch_single_window_chips(
                 if not ok:
                     continue
 
-                # Resize each band individually before concatenating —
-                # 10m and 20m bands have different native pixel counts for the same window.
+                # Resize each band individually before concatenating
                 resized_bands: list[np.ndarray] = []
                 for arr in band_arrays:
                     t_band = torch.from_numpy(arr.astype(np.float32)).unsqueeze(0)
                     r = F.interpolate(t_band, size=(chip_size, chip_size), mode="bilinear", align_corners=False)
                     resized_bands.append(r.squeeze(0).numpy())
-                chip = np.concatenate(resized_bands, axis=0)  # (C, chip_size, chip_size)
+                chip = np.concatenate(resized_bands, axis=0)
 
                 # Compute and append additional spectral indices if requested
                 if indices:
@@ -536,6 +636,45 @@ def _fetch_single_window_chips(
         finally:
             for src in band_srcs:
                 src.close()
+
+        return result, skipped_small
+
+    result: dict[int, np.ndarray] = {}
+    skipped_small = 0
+
+    # Prepare scene data for processing
+    scene_data = []
+    for scene_id, poly_indices in scene_to_polys.items():
+        item = scene_items[scene_id]
+        signed = planetary_computer.sign(item)
+        hrefs = {b: signed.assets[b].href for b in bands if b in signed.assets}
+        if len(hrefs) < len(bands):
+            continue
+        scene_data.append((scene_id, poly_indices, hrefs))
+
+    if num_threads <= 1:
+        # Sequential processing
+        for scene_id, poly_indices, hrefs in tqdm(scene_data, desc="scenes", unit="scene"):
+            scene_result, scene_skipped = _extract_single_scene(scene_id, poly_indices, hrefs)
+            result.update(scene_result)
+            skipped_small += scene_skipped
+    else:
+        # Thread-parallel processing across scenes
+        import threading
+
+        result_lock = threading.Lock()
+
+        def _process_scene_thread(args):
+            scene_id, poly_indices, hrefs = args
+            return _extract_single_scene(scene_id, poly_indices, hrefs)
+
+        with ThreadPoolExecutor(max_workers=num_threads) as pool:
+            futures = {pool.submit(_process_scene_thread, sd): sd[0] for sd in scene_data}
+            for future in tqdm(as_completed(futures), total=len(futures), desc="scenes", unit="scene"):
+                scene_result, scene_skipped = future.result()
+                with result_lock:
+                    result.update(scene_result)
+                    skipped_small += scene_skipped
 
     _log.info(
         "Window %s..%s: %d chips extracted (%d no-scene, %d too-small)",
@@ -553,6 +692,8 @@ def fetch_chips_multitemporal(
     min_native_px: int = 4,
     indices: Sequence[str] | None = None,
     max_missing_windows: int = 1,
+    num_proc: int = 1,
+    num_threads: int = 1,
 ) -> tuple[list, list[int]]:
     """Fetch per-polygon chips across multiple time windows.
 
@@ -575,6 +716,10 @@ def fetch_chips_multitemporal(
         List of index names (e.g. 'ndvi', 'ndre') to append as extra channels for each window.
     max_missing_windows:
         Polygons with more than this many zero-padded windows are dropped.
+    num_proc:
+        Number of processes for parallel window processing (default: 1).
+    num_threads:
+        Number of threads per process for parallel polygon extraction (default: 1).
     """
     import numpy as np
     from pystac_client import Client  # type: ignore[import-not-found]
@@ -586,20 +731,49 @@ def fetch_chips_multitemporal(
 
     # Collect chips per window: list of {poly_idx: chip}
     window_results: list[dict[int, np.ndarray]] = []
-    for date_start, date_end in date_windows:
-        _log.info("Fetching window %s .. %s", date_start, date_end)
-        window_chips = _fetch_single_window_chips(
-            gdf=gdf,
-            bands=bands,
-            date_start=date_start,
-            date_end=date_end,
-            chip_size=chip_size,
-            cloud_cover_max=cloud_cover_max,
-            min_native_px=min_native_px,
-            indices=indices,
-            catalog=catalog,
-        )
-        window_results.append(window_chips)
+
+    if num_proc <= 1:
+        # Sequential processing of windows
+        for date_start, date_end in date_windows:
+            _log.info("Fetching window %s .. %s", date_start, date_end)
+            window_chips = _fetch_single_window_chips(
+                gdf=gdf,
+                bands=bands,
+                date_start=date_start,
+                date_end=date_end,
+                chip_size=chip_size,
+                cloud_cover_max=cloud_cover_max,
+                min_native_px=min_native_px,
+                indices=indices,
+                catalog=catalog,
+                num_threads=num_threads,
+            )
+            window_results.append(window_chips)
+    else:
+        # Parallel processing of windows using ProcessPoolExecutor
+        from concurrent.futures import ProcessPoolExecutor
+
+        def _fetch_window(args):
+            """Helper function to fetch a single window (must be picklable)."""
+            ds, de = args
+            # Each process creates its own catalog connection
+            proc_catalog = Client.open(_PC_STAC_URL)
+            return _fetch_single_window_chips(
+                gdf=gdf,
+                bands=bands,
+                date_start=ds,
+                date_end=de,
+                chip_size=chip_size,
+                cloud_cover_max=cloud_cover_max,
+                min_native_px=min_native_px,
+                indices=indices,
+                catalog=proc_catalog,
+                num_threads=num_threads,
+            )
+
+        with ProcessPoolExecutor(max_workers=num_proc) as pool:
+            futures = list(pool.map(_fetch_window, date_windows))
+        window_results = futures
 
     # Collect all polygon indices that appear in ANY window
     all_poly_indices: set[int] = set()

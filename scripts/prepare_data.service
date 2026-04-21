@@ -1,0 +1,16 @@
+[Unit]
+Description=AI Train GIS data preparation pipeline
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=prog
+WorkingDirectory=/home/prog/PycharmProjects/ai-train-on-gis-data
+ExecStart=/usr/bin/bash /home/prog/PycharmProjects/ai-train-on-gis-data/scripts/prepare_data.sh
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
+

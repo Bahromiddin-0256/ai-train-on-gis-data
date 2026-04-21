@@ -457,6 +457,8 @@ def main(
                 chip_size=chip_size,
                 min_native_px=min_pixels,
                 indices=index_list,
+                num_proc=num_proc,
+                num_threads=num_threads,
             )
         else:
             from gis_train.data.download import fetch_chips_from_stac
@@ -468,6 +470,8 @@ def main(
                 date_end=date_end,
                 chip_size=chip_size,
                 min_native_px=min_pixels,
+                num_proc=num_proc,
+                num_threads=num_threads,
             )
 
         if not chips:
