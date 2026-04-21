@@ -628,6 +628,116 @@ def fetch_chips_multitemporal(
     return chips, labels
 
 
+def download_sentinel1(
+    bbox: BBox,
+    date_start: str,
+    date_end: str,
+    out_dir: Path | str,
+    polarizations: Sequence[str] = ("VV", "VH"),
+    limit: int | None = None,
+    clip: bool = True,
+    max_workers: int = 4,
+) -> DownloadResult:
+    """Download Sentinel-1 GRD assets from Microsoft Planetary Computer.
+
+    Assets are saved as ``{scene_id}_{polarization}.tif`` (VV/VH in dB scale).
+    SAR is cloud-independent, so no cloud-cover filter is applied.
+    """
+    import threading
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    try:
+        import planetary_computer  # type: ignore[import-not-found]
+        import requests  # noqa: F401
+    except ImportError as exc:  # pragma: no cover
+        raise ImportError(
+            "planetary-computer and requests are required for Sentinel-1 downloads"
+        ) from exc
+
+    from tqdm import tqdm
+
+    try:
+        from pystac_client import Client  # type: ignore[import-not-found]
+    except ImportError as exc:  # pragma: no cover
+        raise ImportError("pystac-client is required for Sentinel-1 downloads") from exc
+
+    _S1_GRD_COLLECTION = "sentinel-1-grd"
+    pol_lower = [p.lower() for p in polarizations]
+
+    out = Path(out_dir)
+    out.mkdir(parents=True, exist_ok=True)
+
+    catalog = Client.open(_PC_STAC_URL)
+    _log.info(
+        "Searching %s over %s for %s..%s",
+        _S1_GRD_COLLECTION, bbox.as_tuple(), date_start, date_end,
+    )
+    all_items = list(
+        catalog.search(
+            collections=[_S1_GRD_COLLECTION],
+            bbox=bbox.as_tuple(),
+            datetime=f"{date_start}/{date_end}",
+            limit=limit,
+        ).items()
+    )
+    n_scenes = len(all_items)
+    _log.info("Found %d Sentinel-1 scenes", n_scenes)
+
+    tasks: list[tuple[Path, str, str]] = []
+    for item in all_items:
+        signed = planetary_computer.sign(item)
+        for pol in pol_lower:
+            dest = out / f"{item.id}_{pol.upper()}.tif"
+            if dest.exists():
+                continue
+            asset = signed.assets.get(pol)
+            if asset is None:
+                _log.warning("scene %s missing polarization %s; skipping", item.id, pol)
+                continue
+            tasks.append((dest, asset.href, pol.upper()))
+
+    already = n_scenes * len(pol_lower) - len(tasks)
+    assets_lock = threading.Lock()
+    completed_assets = already
+
+    def _fetch(dest: Path, url: str, pol: str) -> None:
+        tmp = dest.with_suffix(".tmp")
+        tmp.unlink(missing_ok=True)
+        try:
+            _download_with_retry(url, tmp, band=pol, retries=5, backoff=3.0)
+            if clip:
+                _clip_tif_to_bbox(tmp, dest, bbox)
+            else:
+                tmp.rename(dest)
+        finally:
+            tmp.unlink(missing_ok=True)
+
+    progress = tqdm(
+        total=n_scenes * len(pol_lower),
+        initial=already,
+        desc="S1 files",
+        unit="file",
+        dynamic_ncols=True,
+    )
+
+    with ThreadPoolExecutor(max_workers=max_workers) as pool:
+        futures = {pool.submit(_fetch, dest, url, pol): dest for dest, url, pol in tasks}
+        for future in as_completed(futures):
+            dest = futures[future]
+            try:
+                future.result()
+            except Exception as exc:
+                _log.error("failed to download %s: %s", dest.name, exc)
+            with assets_lock:
+                completed_assets += 1
+            progress.update(1)
+            progress.set_postfix(file=dest.name[:40])
+
+    progress.close()
+    _log.info("downloaded %d S1 assets across %d scenes into %s", completed_assets, n_scenes, out)
+    return DownloadResult(out_dir=out, scenes=n_scenes, assets=completed_assets)
+
+
 def download_sentinel2_l2a(
     bbox: BBox,
     date_start: str,

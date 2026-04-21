@@ -57,6 +57,29 @@ def savi(bands: Mapping[str, np.ndarray]) -> np.ndarray:
     return (raw + 1.0) * (DN_SCALE / 2.0)
 
 
+def msi(bands: Mapping[str, np.ndarray]) -> np.ndarray:
+    """Moisture Stress Index: SWIR1/NIR.  Higher values = more water stress."""
+    b8 = bands["B08"].astype(np.float32)
+    b11 = bands["B11"].astype(np.float32)
+    # Ratio typically in [0, 3]; clip and rescale to DN range.
+    raw = b11 / (b8 + _EPS)
+    return np.clip(raw, 0.0, 3.0) * (DN_SCALE / 3.0)
+
+
+def nbr(bands: Mapping[str, np.ndarray]) -> np.ndarray:
+    """Normalized Burn Ratio (NIR-SWIR2)/(NIR+SWIR2).  Proxy for dryness."""
+    return _normalized_diff(bands["B08"], bands["B12"])
+
+
+def vv_vh_ratio(bands: Mapping[str, np.ndarray]) -> np.ndarray:
+    """SAR cross-polarization ratio VV/VH.  Sensitive to crop structure."""
+    vv = bands["VV"].astype(np.float32)
+    vh = bands["VH"].astype(np.float32)
+    # Ratio typically in [0, 10]; clip and rescale.
+    raw = vv / (vh + _EPS)
+    return np.clip(raw, 0.0, 10.0) * (DN_SCALE / 10.0)
+
+
 IndexFn = Callable[[Mapping[str, np.ndarray]], np.ndarray]
 INDEX_REGISTRY: dict[str, IndexFn] = {
     "ndvi": ndvi,
@@ -65,6 +88,9 @@ INDEX_REGISTRY: dict[str, IndexFn] = {
     "ndmi": ndmi,
     "evi": evi,
     "savi": savi,
+    "msi": msi,
+    "nbr": nbr,
+    "vv_vh_ratio": vv_vh_ratio,
 }
 
 
@@ -77,6 +103,9 @@ def required_bands(names: list[str]) -> set[str]:
         "ndmi": {"B08", "B11"},
         "evi": {"B02", "B04", "B08"},
         "savi": {"B04", "B08"},
+        "msi": {"B08", "B11"},
+        "nbr": {"B08", "B12"},
+        "vv_vh_ratio": {"VV", "VH"},
     }
     out: set[str] = set()
     for n in names:
@@ -106,9 +135,62 @@ def compute_indices(
     return np.stack(out, axis=0)
 
 
+def compute_indices_folder(
+    out_dir,
+    bands: list[str],
+    index_names: list[str] | None = None,
+) -> None:
+    """Compute spectral indices from per-band GeoTIFFs in ``out_dir``.
+
+    Expects files named ``{scene_id}_{band}.tif``. Writes new files
+    ``{scene_id}_{INDEX}.tif`` alongside. Skips indices whose required bands
+    are absent for a given scene.
+    """
+    from pathlib import Path
+
+    import numpy as np
+    import rasterio
+
+    if index_names is None:
+        index_names = ["ndvi", "evi", "ndwi", "ndmi"]
+
+    out = Path(out_dir)
+    scene_band_files: dict[str, dict[str, Path]] = {}
+    for tif in sorted(out.glob("*.tif")):
+        stem_parts = tif.stem.rsplit("_", 1)
+        if len(stem_parts) != 2:
+            continue
+        scene_id, band = stem_parts
+        if band in bands:
+            scene_band_files.setdefault(scene_id, {})[band] = tif
+
+    for scene_id, band_files in scene_band_files.items():
+        for index_name in index_names:
+            req = required_bands([index_name])
+            if not req.issubset(band_files.keys()):
+                continue
+            dest = out / f"{scene_id}_{index_name.upper()}.tif"
+            if dest.exists():
+                continue
+            arrays: dict[str, np.ndarray] = {}
+            profile = None
+            for b in sorted(req):
+                with rasterio.open(band_files[b]) as src:
+                    arrays[b] = src.read(1).astype(np.float32)
+                    if profile is None:
+                        profile = src.profile.copy()
+            result_arr = INDEX_REGISTRY[index_name](arrays).astype(np.float32)
+            profile.update(dtype="float32", count=1, compress="deflate")
+            with rasterio.open(dest, "w", **profile) as dst:
+                dst.write(result_arr, 1)
+
+
 __all__ = [
     "INDEX_REGISTRY",
     "compute_indices",
+    "compute_indices_folder",
+    "msi",
+    "nbr",
     "ndmi",
     "ndre",
     "ndvi",
@@ -116,4 +198,5 @@ __all__ = [
     "evi",
     "required_bands",
     "savi",
+    "vv_vh_ratio",
 ]

@@ -4,14 +4,19 @@ Example::
 
     python scripts/download_data.py \\
         --aoi fergana \\
-        --date-start 2021-04-01 \\
-        --date-end 2021-10-31 \\
-        --bands B02,B03,B04,B08 \\
-        --out data/raw/s2
+        --date-start 2023-04-01 \\
+        --date-end 2023-10-01 \\
+        --bands B02,B03,B04,B05,B06,B07,B08,B11,B12 \\
+        --cloud-cover-max 15 \\
+        --compute-indices \\
+        --composite monthly \\
+        --sar \\
+        --export-csv
 """
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 import click
@@ -54,7 +59,7 @@ def _parse_bbox(value: str) -> BBox:
 @click.option(
     "--bands",
     type=str,
-    default="B02,B03,B04,B08",
+    default="B02,B03,B04,B05,B06,B07,B08,B11,B12",
     show_default=True,
     help="Comma-separated Sentinel-2 band IDs.",
 )
@@ -87,15 +92,39 @@ def _parse_bbox(value: str) -> BBox:
 @click.option(
     "--workers",
     type=int,
-    default=4,
-    show_default=True,
-    help="Number of parallel download threads.",
+    default=None,
+    help="Parallel download threads (default: min(8, CPU count)).",
 )
 @click.option(
     "--dry-run",
     is_flag=True,
     default=False,
     help="Only count scenes and files — do not download anything.",
+)
+@click.option(
+    "--compute-indices",
+    is_flag=True,
+    default=False,
+    help="Compute NDVI, EVI, NDWI, NDMI after download.",
+)
+@click.option(
+    "--composite",
+    type=click.Choice(["none", "monthly", "median"]),
+    default="none",
+    show_default=True,
+    help="Temporal compositing strategy applied after download.",
+)
+@click.option(
+    "--sar",
+    is_flag=True,
+    default=False,
+    help="Download Sentinel-1 GRD VV/VH alongside Sentinel-2.",
+)
+@click.option(
+    "--export-csv",
+    is_flag=True,
+    default=False,
+    help="Export pixel samples as ML-ready CSV (requires data/labels.geojson).",
 )
 def main(
     aoi: str,
@@ -107,18 +136,30 @@ def main(
     limit: int | None,
     out: Path,
     no_clip: bool,
+    workers: int | None,
     dry_run: bool,
-    workers: int,
+    compute_indices: bool,
+    composite: str,
+    sar: bool,
+    export_csv: bool,
 ) -> None:
     """Download Sentinel-2 L2A imagery for the given AOI + time window."""
-    bbox_obj = _parse_bbox(bbox) if bbox else _AOI_PRESETS[aoi]
     band_list = [b.strip() for b in bands.split(",") if b.strip()]
+    if not band_list:
+        raise click.BadParameter("At least one band must be specified.", param_hint="--bands")
+
+    bbox_obj = _parse_bbox(bbox) if bbox else _AOI_PRESETS[aoi]
+    effective_workers = workers if workers is not None else min(8, os.cpu_count() or 4)
+
+    _log.info("Date range: %s → %s", date_start, date_end)
+    _log.info("Cloud cover max: %s%%", cloud_cover_max)
     _log.info(
-        "AOI=%s bbox=%s bands=%s clip=%s",
+        "AOI=%s bbox=%s bands=%s clip=%s workers=%d",
         aoi if not bbox else "custom",
         bbox_obj.as_tuple(),
         band_list,
         not no_clip,
+        effective_workers,
     )
 
     if dry_run:
@@ -148,11 +189,41 @@ def main(
         cloud_cover_max=cloud_cover_max,
         limit=limit,
         clip=not no_clip,
-        max_workers=workers,
+        max_workers=effective_workers,
     )
     click.echo(
         f"Downloaded {result.assets} assets across {result.scenes} scenes -> {result.out_dir}"
     )
+
+    if sar:
+        from gis_train.data.download import download_sentinel1
+        sar_out = out.parent / "s1"
+        sar_result = download_sentinel1(
+            bbox=bbox_obj,
+            date_start=date_start,
+            date_end=date_end,
+            out_dir=sar_out,
+            max_workers=effective_workers,
+        )
+        click.echo(
+            f"SAR: downloaded {sar_result.assets} assets across"
+            f" {sar_result.scenes} scenes -> {sar_result.out_dir}"
+        )
+
+    if composite != "none":
+        from gis_train.data.composite import composite_scenes
+        composite_scenes(out, strategy=composite, bands=band_list)
+        click.echo(f"Composite ({composite}) written to {out}")
+
+    if compute_indices:
+        from gis_train.data.indices import compute_indices_folder
+        compute_indices_folder(out, bands=band_list)
+        click.echo(f"Spectral indices written to {out}")
+
+    if export_csv:
+        from gis_train.data.samples import raster_to_tabular
+        csv_path = raster_to_tabular(out, labels_path="data/labels.geojson")
+        click.echo(f"ML-ready CSV written to {csv_path}")
 
 
 if __name__ == "__main__":
