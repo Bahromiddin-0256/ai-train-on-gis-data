@@ -501,7 +501,7 @@ def _fetch_single_window_chips(
                 ok = True
                 for b_name, src in zip(bands, band_srcs):
                     arr = _read_window_from_src(src, geom)
-                    if arr is None:
+                    if arr is None or arr.shape[1] == 0 or arr.shape[2] == 0:
                         ok = False
                         skipped_small += 1
                         break

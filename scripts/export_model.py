@@ -23,9 +23,9 @@ CKPT_PATH = os.path.join(
     os.path.dirname(__file__),
     "..",
     "lightning_logs",
-    "version_17",
+    "version_22",
     "checkpoints",
-    "best-epoch=20-val_f1=0.0000.ckpt",
+    "best-epoch=23-val_f1=0.0000.ckpt",
 )
 OUT_PATH = os.path.join(
     os.path.dirname(__file__),
@@ -72,7 +72,7 @@ def main() -> None:
 
     # Smoke-test before scripting
     with torch.no_grad():
-        dummy = torch.zeros(1, 4, 64, 64)
+        dummy = torch.zeros(1, 30, 64, 64)
         out = net(dummy)
         assert out.shape == (1, 3), f"Unexpected output shape: {out.shape}"
     print("Smoke test passed — output shape: (1, 3)")
