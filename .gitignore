@@ -75,6 +75,7 @@ Thumbs.db
 data/raw/
 data/processed/
 data/processed*
+data/tuman*
 data/interim/
 data/external/
 data/*.tif
