@@ -74,6 +74,7 @@ Thumbs.db
 # Project-specific
 data/raw/
 data/processed/
+data/processed*
 data/interim/
 data/external/
 data/*.tif
