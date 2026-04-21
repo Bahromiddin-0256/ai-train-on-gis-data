@@ -1,0 +1,41 @@
+# Prithvi-EO-1.0-100M foundation model fine-tuned for crop classification.
+#
+# The backbone is frozen by default (freeze_backbone: true); only the
+# classification head is trained. This is appropriate when training data
+# is limited — full fine-tuning needs 2000+ labelled polygons per class.
+#
+# Input pipeline:
+#   45-ch chips (9 bands + 6 indices × 3 windows)
+#   → Sentinel2ToHLSMapper maps to 18 ch (6 HLS bands × 3 timesteps)
+#   → resized to 224×224 inside PrithviCropClassifier.forward()
+#
+# Requires HuggingFace access to download the Prithvi weights:
+#   pip install transformers accelerate
+#   huggingface-cli login  (or set HF_TOKEN env var)
+
+_target_: gis_train.models.prithvi_adapter.PrithviCropClassifier
+_recursive_: false
+
+num_classes: 3
+
+# HuggingFace model ID — use the multi-temporal crop classification variant.
+model_name: "ibm-nasa-geospatial/Prithvi-EO-1.0-100M-multi-temporal-crop-classification"
+
+# Feature dimension from Prithvi's ViT backbone.
+feature_dim: 768
+
+# Freeze backbone weights — fine-tune head only.
+# Set to false for full fine-tuning (requires more data and longer training).
+freeze_backbone: true
+
+class_weights: null
+
+label_smoothing: 0.1
+
+# Focal loss handles class imbalance better when backbone is frozen.
+loss: focal
+focal_gamma: 2.0
+
+learning_rate: 1.0e-3
+
+test_time_augmentation: false
