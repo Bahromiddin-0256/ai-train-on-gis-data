@@ -25,6 +25,7 @@ from pathlib import Path
 import click
 
 from gis_train.data.download import download_sentinel2_l2a
+from gis_train.data.phenology import format_windows_cli, get_stack_windows
 from gis_train.utils.geo import BBox, bbox_from_sequence
 from gis_train.utils.logging import get_logger
 
@@ -125,6 +126,15 @@ def _download_chunk_worker(
 @click.option("--date-start", type=str, required=True, help="Start date (YYYY-MM-DD).")
 @click.option("--date-end", type=str, required=True, help="End date (YYYY-MM-DD).")
 @click.option(
+    "--date-windows",
+    type=str,
+    default=None,
+    help=(
+        "Comma-separated 'start:end' window pairs.  Overrides --date-start/--date-end. "
+        "Example 2025 stack: " + format_windows_cli(get_stack_windows(2025))
+    ),
+)
+@click.option(
     "--bands",
     type=str,
     default="B02,B03,B04,B05,B06,B07,B08,B11,B12",
@@ -155,7 +165,7 @@ def _download_chunk_worker(
     "--no-clip",
     is_flag=True,
     default=False,
-    help="Disable bbox clipping (download full 110×110 km tiles).",
+    help="Disable bbox clipping (download full 110x110 km tiles).",
 )
 @click.option(
     "--workers",
@@ -212,6 +222,7 @@ def main(
     bbox: str | None,
     date_start: str,
     date_end: str,
+    date_windows: str | None,
     bands: str,
     cloud_cover_max: float,
     limit: int | None,
@@ -236,7 +247,17 @@ def main(
     if processes < 1:
         raise click.BadParameter("--processes must be >= 1", param_hint="--processes")
 
-    _log.info("Date range: %s → %s", date_start, date_end)
+    # Resolve date windows: --date-windows overrides --date-start/--date-end.
+    if date_windows is not None:
+        _pairs = [p.strip().split(":") for p in date_windows.split(",")]
+        if any(len(p) != 2 for p in _pairs):
+            raise click.BadParameter(
+                "each window must be 'start:end'", param_hint="--date-windows"
+            )
+        resolved_windows: list[tuple[str, str]] = [(p[0].strip(), p[1].strip()) for p in _pairs]
+    else:
+        resolved_windows = [(date_start, date_end)]
+
     _log.info("Cloud cover max: %s%%", cloud_cover_max)
     _log.info(
         "AOI=%s bbox=%s bands=%s clip=%s processes=%d threads/process=%d",
@@ -250,110 +271,113 @@ def main(
 
     if dry_run:
         from gis_train.data.download import search_sentinel2_l2a
-        items = list(search_sentinel2_l2a(
-            bbox=bbox_obj,
-            date_start=date_start,
-            date_end=date_end,
-            cloud_cover_max=cloud_cover_max,
-            limit=limit,
-        ))
-        n_files = len(items) * len(band_list)
-        click.echo(f"\nDry run — nothing downloaded.")
-        click.echo(f"  Scenes : {len(items)}")
-        click.echo(f"  Bands  : {len(band_list)}  {band_list}")
-        click.echo(f"  Files  : {n_files}")
-        click.echo(f"  Dates  : {items[-1].datetime.date() if items else '—'}"
-                   f" → {items[0].datetime.date() if items else '—'}")
+        for date_start, date_end in resolved_windows:
+            items = list(search_sentinel2_l2a(
+                bbox=bbox_obj,
+                date_start=date_start,
+                date_end=date_end,
+                cloud_cover_max=cloud_cover_max,
+                limit=limit,
+            ))
+            n_files = len(items) * len(band_list)
+            click.echo(f"\nDry run — nothing downloaded.  Window: {date_start} → {date_end}")
+            click.echo(f"  Scenes : {len(items)}")
+            click.echo(f"  Bands  : {len(band_list)}  {band_list}")
+            click.echo(f"  Files  : {n_files}")
+            click.echo(f"  Dates  : {items[-1].datetime.date() if items else '—'}"
+                       f" → {items[0].datetime.date() if items else '—'}")
         return
 
     out.mkdir(parents=True, exist_ok=True)
 
-    if processes == 1:
-        result = download_sentinel2_l2a(
-            bbox=bbox_obj,
-            date_start=date_start,
-            date_end=date_end,
-            out_dir=out,
-            bands=band_list,
-            cloud_cover_max=cloud_cover_max,
-            limit=limit,
-            clip=not no_clip,
-            max_workers=threads_per_process,
-        )
-        click.echo(
-            f"Downloaded {result.assets} assets across {result.scenes} scenes -> {result.out_dir}"
-        )
-    else:
-        chunks = _split_date_range(date_start, date_end, processes)
-        checkpoint_path = out / ".download_chunks_checkpoint.json"
-        checkpoint_sig = {
-            "bbox": bbox_obj.as_tuple(),
-            "date_start": date_start,
-            "date_end": date_end,
-            "bands": band_list,
-            "cloud_cover_max": cloud_cover_max,
-            "limit": limit,
-            "clip": not no_clip,
-            "processes": len(chunks),
-            "threads_per_process": threads_per_process,
-        }
-
-        completed: set[int] = set()
-        if resume:
-            prior = _load_checkpoint(checkpoint_path)
-            if prior and prior.get("signature") == checkpoint_sig:
-                completed = {int(i) for i in prior.get("completed", [])}
-                _log.info("Resuming: %d/%d chunks already completed", len(completed), len(chunks))
-
-        pending = [
-            (idx, chunk_start, chunk_end)
-            for idx, (chunk_start, chunk_end) in enumerate(chunks)
-            if idx not in completed
-        ]
-
-        total_scenes = 0
-        total_assets = 0
-        if not pending:
-            _log.info("All chunks already completed per checkpoint")
+    for date_start, date_end in resolved_windows:
+        _log.info("Date range: %s → %s", date_start, date_end)
+        if processes == 1:
+            result = download_sentinel2_l2a(
+                bbox=bbox_obj,
+                date_start=date_start,
+                date_end=date_end,
+                out_dir=out,
+                bands=band_list,
+                cloud_cover_max=cloud_cover_max,
+                limit=limit,
+                clip=not no_clip,
+                max_workers=threads_per_process,
+            )
+            click.echo(
+                f"Downloaded {result.assets} assets across {result.scenes} scenes -> {result.out_dir}"
+            )
         else:
-            with ProcessPoolExecutor(max_workers=len(chunks)) as pool:
-                futures = {
-                    pool.submit(
-                        _download_chunk_worker,
-                        bbox_tuple=bbox_obj.as_tuple(),
-                        date_start=chunk_start,
-                        date_end=chunk_end,
-                        out_dir=str(out),
-                        bands=band_list,
-                        cloud_cover_max=cloud_cover_max,
-                        limit=limit,
-                        clip=not no_clip,
-                        threads_per_process=threads_per_process,
-                    ): idx
-                    for idx, chunk_start, chunk_end in pending
-                }
-                for future in as_completed(futures):
-                    idx = futures[future]
-                    scenes, assets = future.result()
-                    total_scenes += scenes
-                    total_assets += assets
-                    completed.add(idx)
-                    if resume:
-                        _write_checkpoint(
-                            checkpoint_path,
-                            {
-                                "signature": checkpoint_sig,
-                                "completed": sorted(completed),
-                                "updated_at": datetime.utcnow().isoformat(timespec="seconds") + "Z",
-                            },
-                        )
+            chunks = _split_date_range(date_start, date_end, processes)
+            checkpoint_path = out / ".download_chunks_checkpoint.json"
+            checkpoint_sig = {
+                "bbox": bbox_obj.as_tuple(),
+                "date_start": date_start,
+                "date_end": date_end,
+                "bands": band_list,
+                "cloud_cover_max": cloud_cover_max,
+                "limit": limit,
+                "clip": not no_clip,
+                "processes": len(chunks),
+                "threads_per_process": threads_per_process,
+            }
 
-        if resume and len(completed) == len(chunks):
-            checkpoint_path.unlink(missing_ok=True)
+            completed: set[int] = set()
+            if resume:
+                prior = _load_checkpoint(checkpoint_path)
+                if prior and prior.get("signature") == checkpoint_sig:
+                    completed = {int(i) for i in prior.get("completed", [])}
+                    _log.info("Resuming: %d/%d chunks already completed", len(completed), len(chunks))
 
-        click.echo(
-            f"Downloaded {total_assets} assets across {total_scenes} chunk-scenes -> {out}"
-        )
+            pending = [
+                (idx, chunk_start, chunk_end)
+                for idx, (chunk_start, chunk_end) in enumerate(chunks)
+                if idx not in completed
+            ]
+
+            total_scenes = 0
+            total_assets = 0
+            if not pending:
+                _log.info("All chunks already completed per checkpoint")
+            else:
+                with ProcessPoolExecutor(max_workers=len(chunks)) as pool:
+                    futures = {
+                        pool.submit(
+                            _download_chunk_worker,
+                            bbox_tuple=bbox_obj.as_tuple(),
+                            date_start=chunk_start,
+                            date_end=chunk_end,
+                            out_dir=str(out),
+                            bands=band_list,
+                            cloud_cover_max=cloud_cover_max,
+                            limit=limit,
+                            clip=not no_clip,
+                            threads_per_process=threads_per_process,
+                        ): idx
+                        for idx, chunk_start, chunk_end in pending
+                    }
+                    for future in as_completed(futures):
+                        idx = futures[future]
+                        scenes, assets = future.result()
+                        total_scenes += scenes
+                        total_assets += assets
+                        completed.add(idx)
+                        if resume:
+                            _write_checkpoint(
+                                checkpoint_path,
+                                {
+                                    "signature": checkpoint_sig,
+                                    "completed": sorted(completed),
+                                    "updated_at": datetime.utcnow().isoformat(timespec="seconds") + "Z",
+                                },
+                            )
+
+            if resume and len(completed) == len(chunks):
+                checkpoint_path.unlink(missing_ok=True)
+
+            click.echo(
+                f"Downloaded {total_assets} assets across {total_scenes} chunk-scenes -> {out}"
+            )
 
     if sar:
         from gis_train.data.download import download_sentinel1
