@@ -30,6 +30,7 @@ from pathlib import Path
 import click
 import numpy as np
 
+from gis_train.data.phenology import format_windows_cli, get_stack_windows
 from gis_train.utils.logging import get_logger
 
 _log = get_logger(__name__)
@@ -145,10 +146,12 @@ def _combine(processed_base: Path, out: Path) -> None:
               help="Max polygons per class per tuman (0 = no limit).")
 @click.option("--bands", default="B02,B03,B04,B05,B06,B07,B08,B11,B12", show_default=True,
               help="Comma-separated Sentinel-2 band IDs.")
-@click.option("--date-windows",
-              default="2025-04-01:2025-05-31,2025-06-01:2025-07-31,2025-08-01:2025-09-30",
-              show_default=True,
-              help="Comma-separated 'start:end' date window pairs for multi-temporal extraction.")
+@click.option(
+    "--date-windows",
+    default=format_windows_cli(get_stack_windows(2025)),
+    show_default=True,
+    help="Comma-separated 'start:end' date window pairs for multi-temporal extraction (phenologically optimised 6-window stack by default).",
+)
 @click.option("--indices", type=str, default="ndvi,evi,ndwi,ndre,msi,nbr", show_default=True,
               help="Comma-separated indices to compute (e.g. ndvi,ndre).")
 @click.option("--labels-dir", type=Path, default=Path("data/labels"), show_default=True,
