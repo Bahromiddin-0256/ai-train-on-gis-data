@@ -26,11 +26,15 @@ set -euo pipefail
 
 VECTORS="${1:-data/labels/labels.geojson}"
 OUTPUT_DIR="${2:-data/processed_regional_mt}"
-DATE_WINDOWS="${3:-2025-04-01:2025-05-31,2025-06-01:2025-07-31,2025-08-01:2025-09-30}"
+DATE_WINDOWS="${3:-2025-03-15:2025-04-15,2025-04-15:2025-05-31,2025-06-01:2025-06-30,2025-07-15:2025-08-31,2025-09-01:2025-09-30,2025-10-01:2025-11-15}"
 BANDS="B02,B03,B04,B05,B06,B07,B08,B11,B12"
 INDICES="ndvi,evi,ndwi,ndre,msi,nbr"
 DATA_CONFIG="configs/data/uzbekistan_s2.yaml"
-N_WINDOWS=3
+N_WINDOWS=6
+# Parallelism: how many tumans to process at once, and per-tuman process/thread counts
+TUMAN_WORKERS="${TUMAN_WORKERS:-4}"
+CHIPS_PROC="${CHIPS_PROC:-2}"
+CHIPS_THREADS="${CHIPS_THREADS:-4}"
 
 echo "========================================"
 echo "Data Preparation Pipeline"
@@ -62,6 +66,9 @@ else
         --bands "$BANDS" \
         --date-windows "$DATE_WINDOWS" \
         --indices "$INDICES" \
+        --tuman-workers "$TUMAN_WORKERS" \
+        --chips-proc "$CHIPS_PROC" \
+        --chips-threads "$CHIPS_THREADS" \
         --out "$OUTPUT_DIR"
 fi
 

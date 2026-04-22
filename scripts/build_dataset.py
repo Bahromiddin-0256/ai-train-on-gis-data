@@ -25,6 +25,7 @@ from __future__ import annotations
 import subprocess
 import sys
 from collections import Counter, defaultdict
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 import click
@@ -130,6 +131,91 @@ def _combine(processed_base: Path, out: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Per-tuman worker
+# ---------------------------------------------------------------------------
+
+def _process_tuman(
+    row: dict,
+    *,
+    uri: str,
+    db: str,
+    collection: str,
+    per_class: int,
+    bands: str,
+    date_windows: str,
+    indices: str,
+    labels_dir: Path,
+    processed_base: Path,
+    python: str,
+    scripts_dir: Path,
+    chips_proc: int,
+    chips_threads: int,
+) -> tuple[str, str | None, list[str]]:
+    """Export labels and extract chips for one tuman.
+
+    Returns ``(tname, error_or_None, log_lines)``.  All output is collected
+    into ``log_lines`` so the caller can print them without interleaving when
+    multiple tumans run concurrently.
+    """
+    tcode = row["_id"].get("tuman_code")
+    tname = (row["_id"].get("tuman") or str(tcode)).strip()
+    vilname = (row["_id"].get("viloyat") or "unknown").strip()
+
+    geojson_path = labels_dir / f"tuman_{tcode}.geojson"
+    chips_dir = processed_base / f"processed_tuman_{tcode}_mt"
+    lines: list[str] = []
+
+    if (chips_dir / "images.npy").exists():
+        lines.append(f"\n[skip] {tname} ({vilname})  — chips already at {chips_dir}")
+        return tname, None, lines
+
+    lines.append(f"\n{'='*60}")
+    lines.append(f"Processing: {tname}  ({vilname}, code={tcode})")
+
+    if not geojson_path.exists():
+        lines.append(f"  → exporting labels → {geojson_path}")
+        cmd = [
+            python, str(scripts_dir / "export_mongodb.py"),
+            "--uri", uri,
+            "--db", db,
+            "--collection", collection,
+            "--tuman-code", str(tcode),
+            "--out", str(geojson_path),
+        ]
+        if per_class > 0:
+            cmd += ["--per-class", str(per_class)]
+        result = subprocess.run(cmd)
+        if result.returncode != 0:
+            msg = f"export_mongodb.py failed for tuman_code={tcode}"
+            lines.append(f"  [ERROR] {msg}")
+            return tname, msg, lines
+    else:
+        lines.append(f"  → using existing labels: {geojson_path}")
+
+    lines.append(f"  → extracting chips (STAC multi-temporal) → {chips_dir}")
+    cmd = [
+        python, str(scripts_dir / "prepare_labels.py"),
+        "--from-stac",
+        "--vectors", str(geojson_path),
+        "--date-windows", date_windows,
+        "--bands", bands,
+        "--chip-size", "64",
+        "--out", str(chips_dir),
+        "--num-proc", str(chips_proc),
+        "--num-threads", str(chips_threads),
+    ]
+    if indices:
+        cmd.extend(["--indices", indices])
+    result = subprocess.run(cmd)
+    if result.returncode != 0:
+        msg = f"prepare_labels.py failed for tuman_code={tcode}"
+        lines.append(f"  [ERROR] {msg}")
+        return tname, msg, lines
+
+    return tname, None, lines
+
+
+# ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
 
@@ -160,6 +246,12 @@ def _combine(processed_base: Path, out: Path) -> None:
               help="Parent directory for processed_tuman_* subdirectories.")
 @click.option("--out", type=Path, default=Path("data/processed_regional"), show_default=True,
               help="Output directory for the combined dataset.")
+@click.option("--tuman-workers", default=1, type=int, show_default=True,
+              help="Number of tumans to process in parallel (each spawns its own subprocesses).")
+@click.option("--chips-proc", default=1, type=int, show_default=True,
+              help="--num-proc value passed to prepare_labels.py per tuman.")
+@click.option("--chips-threads", default=1, type=int, show_default=True,
+              help="--num-threads value passed to prepare_labels.py per tuman.")
 @click.option("--dry-run", is_flag=True,
               help="Print the selection plan without any I/O.")
 @click.option("--combine-only", is_flag=True,
@@ -176,6 +268,9 @@ def main(
     labels_dir: Path,
     processed_base: Path,
     out: Path,
+    tuman_workers: int,
+    chips_proc: int,
+    chips_threads: int,
     dry_run: bool,
     combine_only: bool,
 ) -> None:
@@ -224,66 +319,43 @@ def main(
         return
 
     # ------------------------------------------------------------------
-    # Step 2: export + extract chips per tuman
+    # Step 2: export + extract chips per tuman (parallel or sequential)
     # ------------------------------------------------------------------
     labels_dir.mkdir(parents=True, exist_ok=True)
     errors: list[str] = []
 
-    for row in selected:
-        tcode = row["_id"].get("tuman_code")
-        tname = (row["_id"].get("tuman") or str(tcode)).strip()
-        vilname = (row["_id"].get("viloyat") or "unknown").strip()
+    worker_kwargs = dict(
+        uri=uri, db=db, collection=collection,
+        per_class=per_class, bands=bands,
+        date_windows=date_windows, indices=indices,
+        labels_dir=labels_dir, processed_base=processed_base,
+        python=python, scripts_dir=scripts_dir,
+        chips_proc=chips_proc, chips_threads=chips_threads,
+    )
 
-        geojson_path = labels_dir / f"tuman_{tcode}.geojson"
-        chips_dir = processed_base / f"processed_tuman_{tcode}_mt"
-
-        if (chips_dir / "images.npy").exists():
-            click.echo(f"\n[skip] {tname} ({vilname})  — chips already at {chips_dir}")
-            continue
-
-        click.echo(f"\n{'='*60}")
-        click.echo(f"Processing: {tname}  ({vilname}, code={tcode})")
-
-        # 2a. Export labels from MongoDB (skip if GeoJSON already present)
-        if not geojson_path.exists():
-            click.echo(f"  → exporting labels → {geojson_path}")
-            cmd = [
-                python, str(scripts_dir / "export_mongodb.py"),
-                "--uri", uri,
-                "--db", db,
-                "--collection", collection,
-                "--tuman-code", str(tcode),
-                "--out", str(geojson_path),
-            ]
-            if per_class > 0:
-                cmd += ["--per-class", str(per_class)]
-            result = subprocess.run(cmd)
-            if result.returncode != 0:
-                msg = f"export_mongodb.py failed for tuman_code={tcode}"
-                click.echo(f"  [ERROR] {msg}", err=True)
-                errors.append(msg)
-                continue
-        else:
-            click.echo(f"  → using existing labels: {geojson_path}")
-
-        # 2b. Extract chips via Planetary Computer STAC (multi-temporal)
-        click.echo(f"  → extracting chips (STAC multi-temporal) → {chips_dir}")
-        cmd = [
-            python, str(scripts_dir / "prepare_labels.py"),
-            "--from-stac",
-            "--vectors", str(geojson_path),
-            "--date-windows", date_windows,
-            "--bands", bands,
-            "--chip-size", "64",
-            "--out", str(chips_dir),
-        ]
-        if indices:
-            cmd.extend(["--indices", indices])
-        result = subprocess.run(cmd)
-        if result.returncode != 0:
-            msg = f"prepare_labels.py failed for tuman_code={tcode}"
-            click.echo(f"  [ERROR] {msg}", err=True)
-            errors.append(msg)
+    if tuman_workers <= 1:
+        for row in selected:
+            _, err, lines = _process_tuman(row, **worker_kwargs)
+            for line in lines:
+                click.echo(line)
+            if err:
+                errors.append(err)
+    else:
+        click.echo(
+            f"\nProcessing {len(selected)} tumans with {tuman_workers} parallel workers "
+            f"(chips-proc={chips_proc}, chips-threads={chips_threads})..."
+        )
+        with ThreadPoolExecutor(max_workers=tuman_workers) as pool:
+            futures = {
+                pool.submit(_process_tuman, row, **worker_kwargs): row
+                for row in selected
+            }
+            for future in as_completed(futures):
+                _, err, lines = future.result()
+                for line in lines:
+                    click.echo(line)
+                if err:
+                    errors.append(err)
 
     # ------------------------------------------------------------------
     # Step 3: combine all processed_tuman_* into one dataset
