@@ -63,7 +63,7 @@ python -m gis_train.train data=uzbekistan_s2 model=resnet50_s2 trainer.max_epoch
 |---|---|---|
 | [Sentinel-2 L2A](https://registry.opendata.aws/sentinel-2-l2a-cogs/) via [Microsoft Planetary Computer](https://planetarycomputer.microsoft.com/) | 10m-resolution multispectral imagery | Input features (bands B02, B03, B04, B08 by default) |
 | [CropHarvest](https://github.com/nasaharvest/cropharvest) | Global crop/non-crop labels with Sentinel-2 monthly composites | Default training labels (Uzbekistan subset) |
-| [ESA WorldCereal 2021](https://esa-worldcereal.org/) | Global crop-type maps (maize, winter cereals, ...) | *Hook stubbed — contributions welcome* |
+| [ESA WorldCereal](https://esa-worldcereal.org/) | Seasonal cropland + winter-cereals rasters, self-run for 2024-2025 via CDSE openEO | Label cleanup: `scripts/run_worldcereal.py` produces the rasters, then `scripts/validate_uzcosmos_worldcereal.py` (or `gis_train.data.labels.filter_labels_with_worldcereal`) filters uzcosmos polygons to the agreement-accepted subset |
 
 ## Configuration
 
@@ -93,7 +93,9 @@ If you use this project, please cite the underlying datasets:
 
 ## Roadmap / TODO
 
-- [ ] Implement `load_worldcereal(bbox, year)` loader in `gis_train.data.labels`.
+- [x] WorldCereal label-agreement filter (`scripts/run_worldcereal.py` +
+  `scripts/validate_uzcosmos_worldcereal.py` +
+  `gis_train.data.labels.filter_labels_with_worldcereal`).
 - [ ] Add `TempCNN` time-series model (config stub already present).
 - [ ] Weights & Biases / MLflow logger integration.
 - [ ] Dockerfile + devcontainer.

@@ -7,7 +7,9 @@ their native geo stack.
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
+from pathlib import Path
 
 import numpy as np
 
@@ -97,19 +99,117 @@ def load_cropharvest_uzbekistan(
     return LabeledSamples(features=x, labels=y, class_names=tuple(class_names))
 
 
+def filter_labels_with_worldcereal(
+    labels_path: str | Path,
+    cropland_raster: str | Path,
+    wheat_raster: str | Path | None = None,
+    *,
+    label_field: str = "crop_type",
+    id_field: str = "id",
+    cropland_positive: tuple[int, ...] = (1,),
+    wheat_positive: tuple[int, ...] = (1,),
+    thresholds: object | None = None,
+    keep_review: bool = False,
+) -> list[dict]:
+    """Return the subset of GeoJSON features that agree with WorldCereal.
+
+    Pairs naturally with ``scripts/run_worldcereal.py`` (which produces the
+    rasters) and ``scripts/validate_uzcosmos_worldcereal.py`` (which writes
+    accepted/review/rejected splits to disk). Use this function when you
+    want the filter inline in a Python pipeline — for example, before
+    handing polygons to ``scripts/build_dataset.py`` for Sentinel-2 chip
+    extraction.
+
+    Parameters
+    ----------
+    labels_path:
+        Input GeoJSON FeatureCollection with polygon geometries and
+        ``properties[label_field]`` labels.
+    cropland_raster:
+        WorldCereal seasonal cropland GeoTIFF.
+    wheat_raster:
+        WorldCereal crop-type GeoTIFF (winter-cereals vs. others). Pass
+        ``None`` to do a cropland-only filter.
+    keep_review:
+        If ``True``, ``review``-verdict features are returned alongside
+        ``accepted`` ones. Defaults to ``False`` (strict).
+
+    Returns
+    -------
+    list[dict]
+        The surviving features, each with a ``worldcereal_verdict`` and
+        ``worldcereal_*_fraction`` entry merged into ``properties``.
+    """
+    from gis_train.data.worldcereal import (
+        Thresholds,
+        Verdict,
+        score_polygons,
+    )
+
+    t = thresholds or Thresholds()
+    labels_path = Path(labels_path)
+    data = json.loads(labels_path.read_text())
+    features = data.get("features") if isinstance(data, dict) else None
+    if not features:
+        raise ValueError(f"{labels_path} does not contain a FeatureCollection")
+
+    labelled = [f for f in features if (f.get("properties") or {}).get(label_field) is not None]
+    scores = score_polygons(
+        labelled,
+        cropland_raster=Path(cropland_raster),
+        wheat_raster=Path(wheat_raster) if wheat_raster is not None else None,
+        label_field=label_field,
+        id_field=id_field,
+        cropland_positive=cropland_positive,
+        wheat_positive=wheat_positive,
+        thresholds=t,
+    )
+
+    allowed = {Verdict.ACCEPTED}
+    if keep_review:
+        allowed.add(Verdict.REVIEW)
+
+    out: list[dict] = []
+    for feat, score in zip(labelled, scores, strict=True):
+        if score.verdict not in allowed:
+            continue
+        new_feat = dict(feat)
+        props = dict(feat.get("properties") or {})
+        props["worldcereal_verdict"] = score.verdict.value
+        props["worldcereal_cropland_fraction"] = score.cropland_fraction
+        props["worldcereal_wheat_fraction"] = score.wheat_fraction
+        new_feat["properties"] = props
+        out.append(new_feat)
+
+    _log.info(
+        "worldcereal filter: %d/%d features kept (keep_review=%s)",
+        len(out),
+        len(labelled),
+        keep_review,
+    )
+    return out
+
+
 def load_worldcereal(
     bbox: BBox,
-    year: int = 2021,
+    year: int = 2025,
     **_: object,
 ) -> LabeledSamples:
-    """Placeholder for the ESA WorldCereal loader.
+    """Bbox-style loader — not implemented by design.
 
-    WorldCereal publishes global crop-type maps as COGs. Implementing this
-    requires rasterizing the maps onto Sentinel-2 tiles and is tracked in
-    the project README (TODO). Raising explicitly here keeps the interface
-    stable while signalling that the loader is unimplemented.
+    Unlike CropHarvest (which ships pre-extracted Sentinel-2 patches),
+    WorldCereal only gives you raster masks. Turning a bbox + year into an
+    in-memory ``LabeledSamples`` therefore requires a separate Sentinel-2
+    chip-extraction step (see ``scripts/build_dataset.py``).
+
+    For the common label-cleanup workflow, use
+    :func:`filter_labels_with_worldcereal` instead — it returns the subset
+    of your local polygon labels that WorldCereal agrees with, which is
+    what ``build_dataset.py`` wants as input.
     """
     raise NotImplementedError(
-        "WorldCereal loader is not implemented yet. See README TODO and "
-        "https://esa-worldcereal.org/ for access details."
+        "load_worldcereal is intentionally not implemented for bbox+year — "
+        "WorldCereal ships rasters, not pre-extracted chips. Use "
+        "gis_train.data.labels.filter_labels_with_worldcereal() to filter "
+        "local polygons, then run scripts/build_dataset.py for chip extraction."
     )

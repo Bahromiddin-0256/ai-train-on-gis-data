@@ -26,9 +26,9 @@ CKPT_PATH = os.environ.get(
         os.path.dirname(__file__),
         "..",
         "lightning_logs",
-        "version_21",
+        "version_1",
         "checkpoints",
-        "best-epoch=20-val_f1=0.0000.ckpt",
+        "best-epoch=48-val_f1=0.0000.ckpt",
     ),
 )
 OUT_PATH = os.environ.get(

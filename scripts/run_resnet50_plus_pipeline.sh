@@ -36,7 +36,6 @@ python -m gis_train.train \
     data=uzbekistan_s2_plus \
     "data.data_dir=$DATA_DIR" \
     "data.source=local" \
-    "trainer.default_root_dir=$TRAIN_DIR" \
     "experiment_name=$EXPERIMENT"
 
 # ---------------------------------------------------------------------------
