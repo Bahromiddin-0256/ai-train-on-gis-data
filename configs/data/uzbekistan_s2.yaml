@@ -1,0 +1,69 @@
+# Data config: Sentinel-2 imagery + CropHarvest labels over Uzbekistan.
+#
+# For offline/CI runs, set `source: synthetic` (the DataModule will generate
+# tiny in-memory GeoTIFF fixtures instead of reading from disk).
+
+_target_: gis_train.data.datamodule.CropDataModule
+
+# One of: "cropharvest", "synthetic", "local"
+source: local
+
+# Number of samples to generate when source == "synthetic" (ignored otherwise).
+synthetic_n: 128
+
+# Where raw / processed data lives (ignored when source == "synthetic").
+data_dir: ${hydra:runtime.cwd}/data
+
+# Optional external test set directory (images.npy + labels.npy).
+# If set, this is used as the test split instead of a random split from data_dir.
+external_test_dir: null
+
+# Country filter for CropHarvest loader.
+country: Uzbekistan
+
+# Default AOI — all of Uzbekistan. WGS84 (lon_min, lat_min, lon_max, lat_max).
+# Used by the Sentinel-2 STAC downloader only. Override with --data.bbox=...
+bbox: [56.00, 37.00, 73.15, 45.60]
+
+# Date window for Sentinel-2 scene search (single-temporal fallback).
+# For multi-temporal extraction use scripts/build_dataset.py --date-windows.
+date_start: "2025-04-01"
+date_end: "2025-09-30"
+cloud_cover_max: 20
+
+# Sentinel-2 bands fetched per time window (9 raw bands).
+# Spectral indices are computed at chip-fetch time and appended per window.
+# Channel layout: (9 bands + 6 indices) × 3 windows = 15 ch/window × 3 = 45 total.
+# Model in_channels must match (resnet50_s2/convnext_s2: 45, tempcnn_s2: channels_per_window=15).
+# Recompute mean/std after rebuilding the dataset:
+#   python scripts/compute_band_stats.py \
+#       --images data/processed_regional_mt/images.npy \
+#       --out configs/data/uzbekistan_s2.yaml
+bands: ["B02", "B03", "B04", "B05", "B06", "B07", "B08", "B11", "B12"]
+indices: ["ndvi", "evi", "ndwi", "ndre", "msi", "nbr"]
+
+# Per-channel normalization for 45-channel input (3 windows × 15 ch/window).
+# Order per window: B02,B03,B04,B05,B06,B07,B08,B11,B12,NDVI,EVI,NDWI,NDRE,MSI,NBR
+# Placeholder values — recompute with compute_band_stats.py after rebuilding images.npy.
+mean: [0.1500, 0.1500, 0.1500, 0.1500, 0.1500, 0.1500, 0.1500, 0.1500, 0.1500, 0.1500, 0.1500, 0.1500, 0.1500, 0.1500, 0.1500, 0.1500, 0.1500, 0.1500, 0.1500, 0.1500, 0.1500, 0.1500, 0.1500, 0.1500, 0.1500, 0.1500, 0.1500, 0.1500, 0.1500, 0.1500, 0.1500, 0.1500, 0.1500, 0.1500, 0.1500, 0.1500, 0.1500, 0.1500, 0.1500, 0.1500, 0.1500, 0.1500, 0.1500, 0.1500, 0.1500]
+std:  [0.1000, 0.1000, 0.1000, 0.1000, 0.1000, 0.1000, 0.1000, 0.1000, 0.1000, 0.1000, 0.1000, 0.1000, 0.1000, 0.1000, 0.1000, 0.1000, 0.1000, 0.1000, 0.1000, 0.1000, 0.1000, 0.1000, 0.1000, 0.1000, 0.1000, 0.1000, 0.1000, 0.1000, 0.1000, 0.1000, 0.1000, 0.1000, 0.1000, 0.1000, 0.1000, 0.1000, 0.1000, 0.1000, 0.1000, 0.1000, 0.1000, 0.1000, 0.1000, 0.1000, 0.1000]
+
+# Image patch size fed to the model.
+image_size: 64
+
+# DataLoader settings.
+batch_size: 32
+num_workers: 4
+pin_memory: true
+
+# Train/val/test fractions (used when upstream data has no explicit split).
+val_split: 0.15
+test_split: 0.15
+
+# Class labels (order is meaningful: index -> name).
+# Derived from uzcosmos_flats crop_type values (compound labels normalised
+# to primary crop by scripts/export_mongodb.py).
+classes:
+  - bugdoy
+  - other
+  - paxta

@@ -1,0 +1,36 @@
+# ResNet-50 + accuracy upgrades: focal loss, differential LR, warmup, TTA.
+#
+# Same backbone as resnet50_s2.yaml; differences are loss + optim hyperparams.
+
+_target_: gis_train.models.classifier.CropClassifier
+_recursive_: false
+
+backbone: resnet50
+in_channels: 45
+num_classes: 3
+pretrained: true
+
+class_weights: null
+label_smoothing: 0.1
+
+# Focal loss handles residual class imbalance that weights don't fully fix.
+loss: focal
+focal_gamma: 2.0
+
+# Backbone LR = head LR * 0.1 (finetune pretrained conv slower than fresh head).
+backbone_lr_mult: 0.1
+
+# Linear LR warmup for the first N epochs, then cosine.
+warmup_epochs: 3
+
+# Enable D4 test-time augmentation at val/test.
+test_time_augmentation: true
+
+optimizer:
+  _target_: torch.optim.AdamW
+  lr: 1.0e-3
+  weight_decay: 1.0e-4
+
+scheduler:
+  _target_: torch.optim.lr_scheduler.CosineAnnealingLR
+  T_max: ${trainer.max_epochs}
