@@ -1,9 +1,9 @@
 #!/bin/bash
 # TemporalCNN (per-date spatial encoder + temporal encoder) training pipeline
 #
-# Input : 45-channel chips reshaped to (3 windows × 15 ch/window)
+# Input : 90-channel chips reshaped to (6 windows × 15 ch/window)
 # Model : Lightweight 2D CNN encodes each date independently → spatial features
-#         TempCNN or GRU processes the 3-step time series → class logits.
+#         TempCNN or GRU processes the 6-step time series → class logits.
 #
 # This architecture explicitly models the temporal trajectory (growth curve),
 # which is the highest-signal feature for crop type discrimination.
@@ -12,7 +12,7 @@
 
 set -euo pipefail
 
-DATA_DIR="${1:-data/processed_regional_mt}"
+DATA_DIR="${1:-data/processed_regional_v6win}"
 OUTPUT_DIR="${2:-outputs/tempcnn}"
 TRAIN_DIR="$OUTPUT_DIR/train"
 EXPERIMENT="tempcnn"
@@ -22,7 +22,7 @@ echo "TemporalCNN Pipeline"
 echo "========================================"
 echo "Data     : $DATA_DIR"
 echo "Output   : $OUTPUT_DIR"
-echo "Layout   : 3 windows × 15 ch/window = 45 channels"
+echo "Layout   : 6 windows × 15 ch/window = 90 channels"
 echo ""
 
 mkdir -p "$TRAIN_DIR"
@@ -30,13 +30,12 @@ mkdir -p "$TRAIN_DIR"
 # ---------------------------------------------------------------------------
 # Step 1: Train
 # ---------------------------------------------------------------------------
-echo "Step 1: Training (spatial encoder + TempCNN on 3 time steps)..."
+echo "Step 1: Training (spatial encoder + TempCNN on 6 time steps)..."
 python -m gis_train.train \
     model=tempcnn_s2 \
     data=uzbekistan_s2_plus \
     "data.data_dir=$DATA_DIR" \
     "data.source=local" \
-    "data.n_windows=3" \
     "trainer.default_root_dir=$TRAIN_DIR" \
     "experiment_name=$EXPERIMENT"
 
@@ -61,7 +60,6 @@ python -m gis_train.evaluate \
     data=uzbekistan_s2_plus \
     "data.data_dir=$DATA_DIR" \
     "data.source=local" \
-    "data.n_windows=3" \
     "ckpt=$CKPT" \
     "output_dir=$OUTPUT_DIR"
 
@@ -70,11 +68,14 @@ python -m gis_train.evaluate \
 # ---------------------------------------------------------------------------
 echo ""
 echo "Step 3: Exporting model..."
-CKPT_PATH="$CKPT" python scripts/export_model.py
+EXPORT_DATE="$(date +%Y%m%d-%H%M)"
+EXPORT_PATH="$OUTPUT_DIR/tempcnn_6win-15chPerWin_${EXPORT_DATE}.pt"
+CKPT_PATH="$CKPT" OUT_PATH="$EXPORT_PATH" python scripts/export_model.py
 
 echo ""
 echo "========================================"
 echo "TemporalCNN pipeline complete!"
 echo "  Checkpoint  : $CKPT"
+echo "  Exported .pt: $EXPORT_PATH"
 echo "  Metrics     : $OUTPUT_DIR/evaluation.json"
 echo "========================================"

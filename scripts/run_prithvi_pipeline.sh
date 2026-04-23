@@ -1,7 +1,8 @@
 #!/bin/bash
 # Prithvi-EO-1.0-100M foundation model fine-tuning pipeline
 #
-# Input : 45-channel chips → auto-mapped to 18 HLS channels (6 bands × 3 timesteps)
+# Input : 90-channel chips (6 windows × 15 ch) → Sentinel2ToHLSMapper currently
+#         selects the 3 peak windows and maps to 18 HLS channels (6 bands × 3 timesteps)
 #         → resized to 224×224 inside PrithviCropClassifier.forward()
 # Model : IBM/NASA Prithvi ViT backbone (frozen) + lightweight classification head.
 #
@@ -17,7 +18,7 @@
 
 set -euo pipefail
 
-DATA_DIR="${1:-data/processed_regional_mt}"
+DATA_DIR="${1:-data/processed_regional_v6win}"
 OUTPUT_DIR="${2:-outputs/prithvi}"
 FULL_FINETUNE="${3:-}"
 TRAIN_DIR="$OUTPUT_DIR/train"
@@ -85,12 +86,19 @@ python -m gis_train.evaluate \
 # ---------------------------------------------------------------------------
 echo ""
 echo "Step 3: Exporting Prithvi model..."
-python scripts/export_prithvi_model.py
+EXPORT_DATE="$(date +%Y%m%d-%H%M)"
+FINETUNE_TAG="frozen"
+if [ "$FREEZE_BACKBONE" = "false" ]; then
+    FINETUNE_TAG="finetune"
+fi
+EXPORT_PATH="$OUTPUT_DIR/prithvi-eo-100m_hls-3win_${FINETUNE_TAG}_${EXPORT_DATE}.pt"
+python scripts/export_prithvi_model.py --output "$EXPORT_PATH"
 
 echo ""
 echo "========================================"
 echo "Prithvi pipeline complete!"
 echo "  Checkpoint  : $CKPT"
+echo "  Exported .pt: $EXPORT_PATH"
 echo "  Metrics     : $OUTPUT_DIR/evaluation.json"
 echo ""
 echo "Full fine-tune tip: re-run with --full-finetune once you have"

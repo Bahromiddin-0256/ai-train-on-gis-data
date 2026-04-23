@@ -5,14 +5,14 @@
 # Feature stack:
 #   Raw bands  : B02,B03,B04,B05,B06,B07,B08,B11,B12  (9 Sentinel-2 bands)
 #   Indices    : NDVI, EVI, NDWI, NDRE, MSI, NBR       (computed per window)
-#   Total ch   : (9 + 6) × 3 windows = 45 channels
+#   Total ch   : (9 + 6) × 6 phenological windows = 90 channels
 #   Stats/ch   : mean, std, min, max, p25, median, p75, grad_x, grad_y, var → 10
 #   Temporal   : change_w0w1, change_w1w2, total_change, temporal_std per band
 #   NDVI time  : ndvi_t_max/min/mean/std/p25/p75/range  (7 features)
 
 set -e
 
-DATA_DIR="${1:-data/processed_regional_mt}"
+DATA_DIR="${1:-data/processed_regional_v6win}"
 OUTPUT_DIR="${2:-outputs/xgboost}"
 
 echo "========================================"
@@ -27,7 +27,7 @@ echo "Step 1: Extracting features..."
 #python scripts/extract_features.py \
 #    --data-dir "$DATA_DIR" \
 #    --output "$OUTPUT_DIR/features.csv" \
-#    --n-windows 3 \
+#    --n-windows 6 \
 #    --bands "B02,B03,B04,B05,B06,B07,B08,B11,B12" \
 #    --indices "ndvi,evi,ndwi,ndre,msi,nbr"
 
@@ -61,8 +61,19 @@ python scripts/evaluate_xgboost.py \
     --class-names "bugdoy,other,paxta" \
     --save-predictions
 
+
+# Step 4: Archive a versioned copy of the trained model (JSON, not TorchScript)
+EXPORT_DATE="$(date +%Y%m%d-%H%M)"
+EXPORT_PATH="$OUTPUT_DIR/xgboost_6win-45feat_${EXPORT_DATE}.json"
+if [ -f "$OUTPUT_DIR/xgboost_model.json" ]; then
+    cp "$OUTPUT_DIR/xgboost_model.json" "$EXPORT_PATH"
+    echo ""
+    echo "Archived versioned model: $EXPORT_PATH"
+fi
+
 echo ""
 echo "========================================"
 echo "Pipeline complete!"
 echo "Results saved to: $OUTPUT_DIR"
+echo "Versioned model : $EXPORT_PATH"
 echo "========================================"

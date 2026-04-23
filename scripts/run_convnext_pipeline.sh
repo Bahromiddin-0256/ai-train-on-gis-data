@@ -1,9 +1,9 @@
 #!/bin/bash
 # ConvNeXt-Tiny (ImageNet pretrained) training pipeline
 #
-# Input : 45-channel multi-temporal chips (9 raw bands + 6 indices × 3 windows)
+# Input : 90-channel multi-temporal chips (9 raw bands + 6 indices × 6 phenological windows)
 # Model : ConvNeXt-Tiny with ImageNet pretrained weights, first conv replaced
-#         to accept 45 channels (tiled init from 3-channel ImageNet weights).
+#         to accept 90 channels (tiled init from 3-channel ImageNet weights).
 #
 # ConvNeXt typically converges more stably than ResNet on small datasets due to
 # its depthwise conv structure and stronger regularization defaults.
@@ -12,7 +12,7 @@
 
 set -euo pipefail
 
-DATA_DIR="${1:-data/processed_regional_mt}"
+DATA_DIR="${1:-data/processed_regional_v6win}"
 OUTPUT_DIR="${2:-outputs/convnext}"
 TRAIN_DIR="$OUTPUT_DIR/train"
 EXPERIMENT="convnext"
@@ -67,11 +67,14 @@ python -m gis_train.evaluate \
 # ---------------------------------------------------------------------------
 echo ""
 echo "Step 3: Exporting model..."
-CKPT_PATH="$CKPT" python scripts/export_model.py
+EXPORT_DATE="$(date +%Y%m%d-%H%M)"
+EXPORT_PATH="$OUTPUT_DIR/convnext-tiny_imagenet_90ch-6win_${EXPORT_DATE}.pt"
+CKPT_PATH="$CKPT" OUT_PATH="$EXPORT_PATH" python scripts/export_model.py
 
 echo ""
 echo "========================================"
 echo "ConvNeXt pipeline complete!"
 echo "  Checkpoint  : $CKPT"
+echo "  Exported .pt: $EXPORT_PATH"
 echo "  Metrics     : $OUTPUT_DIR/evaluation.json"
 echo "========================================"

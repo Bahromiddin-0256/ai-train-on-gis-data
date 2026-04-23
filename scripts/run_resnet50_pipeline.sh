@@ -1,15 +1,15 @@
 #!/bin/bash
 # ResNet-50 (Sentinel-2 MoCo pretrained) training pipeline
 #
-# Input : 45-channel multi-temporal chips (9 raw bands + 6 indices × 3 windows)
+# Input : 90-channel multi-temporal chips (9 raw bands + 6 indices × 6 phenological windows)
 # Model : ResNet-50 backbone with pretrained Sentinel-2 MoCo weights,
-#         first conv patched to accept 45 channels via band-aware warm init.
+#         first conv patched to accept 90 channels via band-aware warm init.
 #
 # Usage: ./scripts/run_resnet50_pipeline.sh [data_dir] [output_dir]
 
 set -euo pipefail
 
-DATA_DIR="${1:-data/processed_regional_mt}"
+DATA_DIR="${1:-data/processed_regional_v6win}"
 OUTPUT_DIR="${2:-outputs/resnet50}"
 TRAIN_DIR="$OUTPUT_DIR/train"
 EXPERIMENT="resnet50"
@@ -63,11 +63,14 @@ python -m gis_train.evaluate \
 # ---------------------------------------------------------------------------
 echo ""
 echo "Step 3: Exporting model..."
-CKPT_PATH="$CKPT" python scripts/export_model.py
+EXPORT_DATE="$(date +%Y%m%d-%H%M)"
+EXPORT_PATH="$OUTPUT_DIR/resnet50_s2-moco_90ch-6win_${EXPORT_DATE}.pt"
+CKPT_PATH="$CKPT" OUT_PATH="$EXPORT_PATH" python scripts/export_model.py
 
 echo ""
 echo "========================================"
 echo "ResNet-50 pipeline complete!"
 echo "  Checkpoint  : $CKPT"
+echo "  Exported .pt: $EXPORT_PATH"
 echo "  Metrics     : $OUTPUT_DIR/evaluation.json"
 echo "========================================"
