@@ -7,6 +7,7 @@ lean environment (e.g. CI) never needs network or GDAL-linked wheels.
 from __future__ import annotations
 
 from collections.abc import Iterable, Sequence
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -750,14 +751,17 @@ def fetch_chips_multitemporal(
             )
             window_results.append(window_chips)
     else:
-        # Parallel processing of windows using ProcessPoolExecutor
-        from concurrent.futures import ProcessPoolExecutor
+        # Parallel processing of windows. Window fetches are I/O-bound (STAC HTTP
+        # queries + COG band reads that release the GIL via rasterio), so threads
+        # suffice and avoid ProcessPoolExecutor's pickling constraints on closures
+        # and non-picklable gdf/catalog objects.
+        from concurrent.futures import ThreadPoolExecutor
 
         def _fetch_window(args):
-            """Helper function to fetch a single window (must be picklable)."""
             ds, de = args
-            # Each process creates its own catalog connection
-            proc_catalog = Client.open(_PC_STAC_URL)
+            # Each worker opens its own catalog client to avoid shared-session
+            # contention across threads.
+            thread_catalog = Client.open(_PC_STAC_URL)
             return _fetch_single_window_chips(
                 gdf=gdf,
                 bands=bands,
@@ -767,13 +771,12 @@ def fetch_chips_multitemporal(
                 cloud_cover_max=cloud_cover_max,
                 min_native_px=min_native_px,
                 indices=indices,
-                catalog=proc_catalog,
+                catalog=thread_catalog,
                 num_threads=num_threads,
             )
 
-        with ProcessPoolExecutor(max_workers=num_proc) as pool:
-            futures = list(pool.map(_fetch_window, date_windows))
-        window_results = futures
+        with ThreadPoolExecutor(max_workers=num_proc) as pool:
+            window_results = list(pool.map(_fetch_window, date_windows))
 
     # Collect all polygon indices that appear in ANY window
     all_poly_indices: set[int] = set()

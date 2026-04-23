@@ -25,6 +25,7 @@ from __future__ import annotations
 import subprocess
 import sys
 from collections import Counter, defaultdict
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 import click
@@ -87,13 +88,22 @@ def _select_tumans(rows: list[dict], n_per_viloyat: int) -> list[dict]:
 # ---------------------------------------------------------------------------
 
 def _combine(processed_base: Path, out: Path) -> None:
-    """Stack all processed_tuman_* subdirs into one images/labels .npy pair."""
+    """Stack all processed_tuman_* subdirs into one images/labels .npy pair.
+
+    Streams via np.lib.format.open_memmap so peak RAM stays bounded to a
+    single tuman's chips (not the full combined array, which can exceed
+    100 GB for the 6-window 90-channel phenology stack).
+    """
     tuman_dirs = sorted(processed_base.glob("processed_tuman_*"))
     if not tuman_dirs:
         raise click.ClickException(f"No processed_tuman_* dirs found under {processed_base}")
 
-    all_images: list[np.ndarray] = []
-    all_labels: list[np.ndarray] = []
+    # Pass 1: inspect each tuman to determine total size and chip shape.
+    plan: list[tuple[Path, Path, int]] = []
+    total_n = 0
+    chip_shape: tuple[int, ...] | None = None
+    chip_dtype = None
+    label_dtype = None
 
     for d in tuman_dirs:
         imgs_path = d / "images.npy"
@@ -101,31 +111,66 @@ def _combine(processed_base: Path, out: Path) -> None:
         if not imgs_path.exists() or not lbls_path.exists():
             click.echo(f"  [skip] {d.name} — missing images.npy / labels.npy")
             continue
-        imgs = np.load(imgs_path)
-        lbls = np.load(lbls_path)
-        all_images.append(imgs)
-        all_labels.append(lbls)
-        click.echo(f"  + {d.name}: {len(imgs):,} chips")
+        imgs_header = np.load(imgs_path, mmap_mode="r")
+        lbls_header = np.load(lbls_path, mmap_mode="r")
+        n = int(imgs_header.shape[0])
+        if n != int(lbls_header.shape[0]):
+            click.echo(f"  [skip] {d.name} — images/labels length mismatch")
+            continue
+        if chip_shape is None:
+            chip_shape = tuple(int(x) for x in imgs_header.shape[1:])
+            chip_dtype = imgs_header.dtype
+            label_dtype = lbls_header.dtype
+        elif tuple(int(x) for x in imgs_header.shape[1:]) != chip_shape:
+            raise click.ClickException(
+                f"shape mismatch at {d.name}: expected (*,{chip_shape}), got {imgs_header.shape}"
+            )
+        plan.append((imgs_path, lbls_path, n))
+        total_n += n
+        click.echo(f"  + {d.name}: {n:,} chips")
 
-    if not all_images:
+    if not plan or chip_shape is None:
         raise click.ClickException("Nothing to combine — all dirs were skipped.")
 
-    combined_images = np.concatenate(all_images, axis=0)
-    combined_labels = np.concatenate(all_labels, axis=0)
-
     out.mkdir(parents=True, exist_ok=True)
-    np.save(out / "images.npy", combined_images)
-    np.save(out / "labels.npy", combined_labels)
+    out_imgs_path = out / "images.npy"
+    out_lbls_path = out / "labels.npy"
+    click.echo(
+        f"\nAllocating output: images=({total_n},{chip_shape}) dtype={chip_dtype}, "
+        f"labels=({total_n},) dtype={label_dtype}"
+    )
+    out_imgs = np.lib.format.open_memmap(
+        out_imgs_path, mode="w+", dtype=chip_dtype, shape=(total_n, *chip_shape),
+    )
+    out_lbls = np.lib.format.open_memmap(
+        out_lbls_path, mode="w+", dtype=label_dtype, shape=(total_n,),
+    )
+
+    # Pass 2: stream each tuman into the preallocated memmap.
+    offset = 0
+    for imgs_path, lbls_path, n in plan:
+        imgs = np.load(imgs_path, mmap_mode="r")
+        lbls = np.load(lbls_path, mmap_mode="r")
+        out_imgs[offset:offset + n] = imgs
+        out_lbls[offset:offset + n] = lbls
+        offset += n
+        del imgs, lbls  # release mmap handles
+    assert offset == total_n, (offset, total_n)
+    out_imgs.flush()
+    out_lbls.flush()
+    del out_imgs, out_lbls
 
     click.echo(f"\nCombined dataset → {out}/")
-    click.echo(f"  Total chips : {len(combined_images):,}")
-    click.echo(f"  Shape       : {combined_images.shape}")
+    click.echo(f"  Total chips : {total_n:,}")
+    click.echo(f"  Shape       : ({total_n},{chip_shape})")
 
+    # Reload labels via mmap for class distribution (cheap — a few MB).
+    combined_labels = np.load(out_lbls_path, mmap_mode="r")
     counts = Counter(combined_labels.tolist())
     click.echo("\nClass distribution:")
     for idx, n in sorted(counts.items()):
         name = _CLASS_NAMES[idx] if idx < len(_CLASS_NAMES) else str(idx)
-        pct = n / len(combined_labels) * 100
+        pct = n / total_n * 100
         click.echo(f"  {name:<20} {n:>8,}  ({pct:.1f}%)")
 
 
@@ -160,6 +205,12 @@ def _combine(processed_base: Path, out: Path) -> None:
               help="Parent directory for processed_tuman_* subdirectories.")
 @click.option("--out", type=Path, default=Path("data/processed_regional"), show_default=True,
               help="Output directory for the combined dataset.")
+@click.option("--num-proc", default=6, type=int, show_default=True,
+              help="Processes for parallel window fetches inside prepare_labels.py (default matches 6-window stack).")
+@click.option("--num-threads", default=4, type=int, show_default=True,
+              help="Threads per window for parallel scene reads inside prepare_labels.py.")
+@click.option("--parallel-tumans", default=1, type=int, show_default=True,
+              help="Number of tumans to process concurrently. Each tuman spawns prepare_labels with num_proc*num_threads workers, so total concurrency = parallel_tumans × num_proc × num_threads.")
 @click.option("--dry-run", is_flag=True,
               help="Print the selection plan without any I/O.")
 @click.option("--combine-only", is_flag=True,
@@ -176,6 +227,9 @@ def main(
     labels_dir: Path,
     processed_base: Path,
     out: Path,
+    num_proc: int,
+    num_threads: int,
+    parallel_tumans: int,
     dry_run: bool,
     combine_only: bool,
 ) -> None:
@@ -227,63 +281,89 @@ def main(
     # Step 2: export + extract chips per tuman
     # ------------------------------------------------------------------
     labels_dir.mkdir(parents=True, exist_ok=True)
+    tuman_logs_dir = processed_base / "logs"
+    tuman_logs_dir.mkdir(parents=True, exist_ok=True)
     errors: list[str] = []
 
-    for row in selected:
+    def _process_tuman(row: dict) -> tuple[bool, str]:
         tcode = row["_id"].get("tuman_code")
         tname = (row["_id"].get("tuman") or str(tcode)).strip()
         vilname = (row["_id"].get("viloyat") or "unknown").strip()
 
         geojson_path = labels_dir / f"tuman_{tcode}.geojson"
         chips_dir = processed_base / f"processed_tuman_{tcode}_mt"
+        tuman_log = tuman_logs_dir / f"tuman_{tcode}.log"
 
         if (chips_dir / "images.npy").exists():
-            click.echo(f"\n[skip] {tname} ({vilname})  — chips already at {chips_dir}")
-            continue
+            click.echo(f"[skip] {tname} ({vilname})  — chips already at {chips_dir}")
+            return True, ""
 
-        click.echo(f"\n{'='*60}")
-        click.echo(f"Processing: {tname}  ({vilname}, code={tcode})")
+        click.echo(f"[start] {tname}  ({vilname}, code={tcode}) → log: {tuman_log}")
 
-        # 2a. Export labels from MongoDB (skip if GeoJSON already present)
-        if not geojson_path.exists():
-            click.echo(f"  → exporting labels → {geojson_path}")
+        with tuman_log.open("w") as logf:
+            # 2a. Export labels from MongoDB (skip if GeoJSON already present)
+            if not geojson_path.exists():
+                logf.write(f"→ exporting labels → {geojson_path}\n"); logf.flush()
+                cmd = [
+                    python, str(scripts_dir / "export_mongodb.py"),
+                    "--uri", uri,
+                    "--db", db,
+                    "--collection", collection,
+                    "--tuman-code", str(tcode),
+                    "--out", str(geojson_path),
+                ]
+                if per_class > 0:
+                    cmd += ["--per-class", str(per_class)]
+                result = subprocess.run(cmd, stdout=logf, stderr=subprocess.STDOUT)
+                if result.returncode != 0:
+                    msg = f"export_mongodb.py failed for tuman_code={tcode}"
+                    click.echo(f"[ERROR] {msg}", err=True)
+                    return False, msg
+            else:
+                logf.write(f"→ using existing labels: {geojson_path}\n"); logf.flush()
+
+            # 2b. Extract chips via Planetary Computer STAC (multi-temporal)
+            logf.write(f"→ extracting chips (STAC multi-temporal) → {chips_dir}\n"); logf.flush()
             cmd = [
-                python, str(scripts_dir / "export_mongodb.py"),
-                "--uri", uri,
-                "--db", db,
-                "--collection", collection,
-                "--tuman-code", str(tcode),
-                "--out", str(geojson_path),
+                python, str(scripts_dir / "prepare_labels.py"),
+                "--from-stac",
+                "--vectors", str(geojson_path),
+                "--date-windows", date_windows,
+                "--bands", bands,
+                "--chip-size", "64",
+                "--out", str(chips_dir),
+                "--num-proc", str(num_proc),
+                "--num-threads", str(num_threads),
             ]
-            if per_class > 0:
-                cmd += ["--per-class", str(per_class)]
-            result = subprocess.run(cmd)
+            if indices:
+                cmd.extend(["--indices", indices])
+            result = subprocess.run(cmd, stdout=logf, stderr=subprocess.STDOUT)
             if result.returncode != 0:
-                msg = f"export_mongodb.py failed for tuman_code={tcode}"
-                click.echo(f"  [ERROR] {msg}", err=True)
-                errors.append(msg)
-                continue
-        else:
-            click.echo(f"  → using existing labels: {geojson_path}")
+                msg = f"prepare_labels.py failed for tuman_code={tcode}"
+                click.echo(f"[ERROR] {msg}", err=True)
+                return False, msg
 
-        # 2b. Extract chips via Planetary Computer STAC (multi-temporal)
-        click.echo(f"  → extracting chips (STAC multi-temporal) → {chips_dir}")
-        cmd = [
-            python, str(scripts_dir / "prepare_labels.py"),
-            "--from-stac",
-            "--vectors", str(geojson_path),
-            "--date-windows", date_windows,
-            "--bands", bands,
-            "--chip-size", "64",
-            "--out", str(chips_dir),
-        ]
-        if indices:
-            cmd.extend(["--indices", indices])
-        result = subprocess.run(cmd)
-        if result.returncode != 0:
-            msg = f"prepare_labels.py failed for tuman_code={tcode}"
-            click.echo(f"  [ERROR] {msg}", err=True)
-            errors.append(msg)
+        click.echo(f"[done]  {tname}  ({vilname}, code={tcode})")
+        return True, ""
+
+    if parallel_tumans <= 1:
+        for row in selected:
+            ok, msg = _process_tuman(row)
+            if not ok:
+                errors.append(msg)
+    else:
+        click.echo(f"\nProcessing {len(selected)} tumans with {parallel_tumans} parallel workers...")
+        with ThreadPoolExecutor(max_workers=parallel_tumans) as pool:
+            futures = {pool.submit(_process_tuman, row): row for row in selected}
+            for fut in as_completed(futures):
+                try:
+                    ok, msg = fut.result()
+                    if not ok:
+                        errors.append(msg)
+                except Exception as exc:  # pragma: no cover - defensive
+                    row = futures[fut]
+                    tcode = row["_id"].get("tuman_code")
+                    errors.append(f"tuman_code={tcode} crashed: {exc!r}")
 
     # ------------------------------------------------------------------
     # Step 3: combine all processed_tuman_* into one dataset
