@@ -9,6 +9,11 @@
 #   → Sentinel2ToHLSMapper maps to 18 ch (6 HLS bands × 3 timesteps)
 #   → resized to 224×224 inside PrithviCropClassifier.forward()
 #
+# NOTE: this config is pinned to the legacy 3-window/45-channel pipeline because
+# Sentinel2ToHLSMapper is hardcoded for 3 timesteps. To use Prithvi with the new
+# 6-window phenological stack, rebuild a separate images_3win.npy (using only
+# the 3 peak windows 04-15→05-31, 07-15→08-31, 09-01→09-30) or extend the mapper.
+#
 # Requires HuggingFace access to download the Prithvi weights:
 #   pip install transformers accelerate
 #   huggingface-cli login  (or set HF_TOKEN env var)

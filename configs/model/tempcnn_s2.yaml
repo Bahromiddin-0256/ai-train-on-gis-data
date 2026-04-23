@@ -7,7 +7,8 @@ _target_: gis_train.models.temporal.TemporalCropClassifier
 _recursive_: false
 
 # Must match data.n_windows × data.channels_per_window.
-n_windows: 3
+# 6 phenological windows from gis_train.data.phenology.get_stack_windows.
+n_windows: 6
 channels_per_window: 15
 
 num_classes: 3

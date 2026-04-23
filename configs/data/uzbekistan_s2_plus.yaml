@@ -1,6 +1,6 @@
 # Richer Uzbekistan-S2 data config: Mixup/CutMix, temporal+band dropout.
 #
-# Channel layout: 3 windows × 15 ch/window (9 bands + 6 indices) = 45 total.
+# Channel layout: 6 phenological windows × 15 ch/window (9 bands + 6 indices) = 90 total.
 # Indices: ndvi,evi,ndwi,ndre,msi,nbr — set via build_dataset.py --indices.
 
 defaults:
@@ -8,7 +8,7 @@ defaults:
   - _self_
 
 # Multi-temporal layout hint used by TemporalDropout.
-n_windows: 3
+n_windows: 6
 
 # Whole-timestamp dropout (p fraction of windows zeroed each step).
 temporal_dropout: 0.15

@@ -6,7 +6,8 @@ _target_: gis_train.models.classifier.CropClassifier
 _recursive_: false
 
 backbone: resnet50
-in_channels: 45
+# 6 phenological windows × 15 ch/window = 90.
+in_channels: 90
 num_classes: 3
 pretrained: true
 
