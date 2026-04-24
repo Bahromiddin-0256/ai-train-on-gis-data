@@ -9,6 +9,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
+import torch
 import hydra
 import pytorch_lightning as pl
 from hydra.utils import instantiate
@@ -34,8 +35,14 @@ def train(cfg: DictConfig) -> dict[str, Any]:
     _log.info("resolved config:\n%s", OmegaConf.to_yaml(cfg, resolve=True))
     _set_seed(int(cfg.get("seed", 42)))
 
+    torch.backends.cudnn.benchmark = True
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.set_float32_matmul_precision("high")
+
     datamodule = instantiate(cfg.data)
     model = instantiate(cfg.model)
+    if torch.cuda.is_available():
+        model = torch.compile(model)
     trainer: pl.Trainer = instantiate(cfg.trainer)
 
     trainer.fit(model=model, datamodule=datamodule)

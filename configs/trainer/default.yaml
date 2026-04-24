@@ -5,9 +5,9 @@ _target_: pytorch_lightning.Trainer
 max_epochs: 50
 accelerator: auto          # "cpu" | "gpu" | "auto"
 devices: auto
-precision: 32-true         # Use "16-mixed" on GPU for speedup
+precision: bf16-mixed      # RTX 5090 native bf16 support
 log_every_n_steps: 10
-deterministic: true
+deterministic: false       # must be false for bf16-mixed + cudnn.benchmark
 fast_dev_run: false        # Override from CLI for a 1-batch smoke run
 gradient_clip_val: 1.0
 check_val_every_n_epoch: 1
