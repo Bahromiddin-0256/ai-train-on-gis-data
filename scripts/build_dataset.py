@@ -71,15 +71,37 @@ def _query_tumans(uri: str, db: str, collection: str) -> list[dict]:
 
 
 def _select_tumans(rows: list[dict], n_per_viloyat: int) -> list[dict]:
-    """For each viloyat, keep the top-N tumans by polygon count."""
-    by_viloyat: dict[str, list[dict]] = defaultdict(list)
-    for row in rows:
-        vil = (row["_id"].get("viloyat") or "unknown").strip()
-        by_viloyat[vil].append(row)
+    """For each viloyat, keep the top-N tumans by polygon count.
 
+    Groups by the first 4 digits of tuman_code (the reliable numeric viloyat
+    identifier) rather than the free-text viloyat name, which can vary across
+    records for the same region. Also deduplicates by tuman_code, summing
+    polygon counts across duplicate entries before ranking.
+    """
+    # Aggregate polygon counts per tuman_code, keeping one canonical row.
+    by_tcode: dict[int, dict] = {}
+    for row in rows:
+        tcode = row["_id"].get("tuman_code")
+        if tcode is None:
+            continue
+        tcode = int(tcode)
+        if tcode not in by_tcode:
+            by_tcode[tcode] = dict(row)  # shallow copy so we can mutate count
+            by_tcode[tcode]["count"] = row["count"]
+        else:
+            by_tcode[tcode]["count"] += row["count"]
+
+    # Group deduplicated tumans by 4-digit viloyat prefix.
+    by_viloyat: dict[int, list[dict]] = defaultdict(list)
+    for tcode, row in by_tcode.items():
+        vil_prefix = int(str(tcode)[:4])
+        by_viloyat[vil_prefix].append(row)
+
+    # Within each viloyat pick top-N by total polygon count.
     selected: list[dict] = []
-    for vil in sorted(by_viloyat):
-        selected.extend(by_viloyat[vil][:n_per_viloyat])
+    for vil_prefix in sorted(by_viloyat):
+        candidates = sorted(by_viloyat[vil_prefix], key=lambda r: r["count"], reverse=True)
+        selected.extend(candidates[:n_per_viloyat])
     return selected
 
 
@@ -276,19 +298,28 @@ def main(
     rows = _query_tumans(uri, db, collection)
     selected = _select_tumans(rows, n_per_viloyat)
 
-    # Print selection summary
-    by_vil: dict[str, list[dict]] = defaultdict(list)
+    # Print selection summary — group by 4-digit viloyat prefix for consistency.
+    by_vil: dict[int, list[dict]] = defaultdict(list)
     for row in selected:
-        vil = (row["_id"].get("viloyat") or "unknown").strip()
-        by_vil[vil].append(row)
+        tcode = int(row["_id"].get("tuman_code") or 0)
+        vil_prefix = int(str(tcode)[:4])
+        by_vil[vil_prefix].append(row)
+
+    # Pick a display name: the most common viloyat string within each prefix group.
+    def _vil_display_name(rows: list[dict]) -> str:
+        from collections import Counter as _Counter
+        names = [(r["_id"].get("viloyat") or "unknown").strip() for r in rows]
+        return _Counter(names).most_common(1)[0][0]
 
     click.echo(
         f"\nSelected {len(selected)} tumans across {len(by_vil)} viloyats "
         f"({n_per_viloyat} per viloyat):\n"
     )
-    for vil in sorted(by_vil):
-        click.echo(f"  {vil}:")
-        for t in by_vil[vil]:
+    for vil_prefix in sorted(by_vil):
+        vil_rows = by_vil[vil_prefix]
+        vil_label = _vil_display_name(vil_rows)
+        click.echo(f"  {vil_label}:")
+        for t in sorted(vil_rows, key=lambda r: r["count"], reverse=True):
             tcode = t["_id"].get("tuman_code")
             tname = t["_id"].get("tuman") or "?"
             count = t["count"]

@@ -109,7 +109,7 @@ class CropClassificationDataset(Dataset):
 
             with rasterio.open(self._geotiff_paths[index]) as src:
                 arr = src.read()  # (C, H, W)
-        tensor = torch.as_tensor(np.ascontiguousarray(arr), dtype=torch.float32)
+        tensor = torch.as_tensor(np.ascontiguousarray(arr).copy(), dtype=torch.float32)
         if tensor.ndim != 3:
             raise ValueError(f"expected (C, H, W); got {tuple(tensor.shape)}")
         return tensor

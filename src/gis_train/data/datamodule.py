@@ -299,7 +299,7 @@ class CropDataModule(pl.LightningDataModule):
                     f"expected {images_path} and {labels_path}; run "
                     "`python scripts/prepare_labels.py` first"
                 )
-            return np.load(images_path), np.load(labels_path)
+            return np.load(images_path, mmap_mode="r"), np.load(labels_path)
 
         if self.source == "cropharvest":
             from gis_train.data.labels import load_cropharvest_uzbekistan
