@@ -39,7 +39,10 @@ def evaluate(cfg: DictConfig) -> dict[str, Any]:
     datamodule = instantiate(cfg.data)
     # Rebuild the same architecture, then overwrite with checkpoint weights.
     model: CropClassifier = instantiate(cfg.model)
-    state = torch.load(ckpt_path, map_location="cpu")
+    # weights_only=False: Lightning checkpoints contain pickled DictConfig /
+    # optimizer state, which PyTorch 2.6+ rejects under the new weights_only
+    # default. Our own checkpoints are trusted.
+    state = torch.load(ckpt_path, map_location="cpu", weights_only=False)
     model.load_state_dict(state["state_dict"])
 
     trainer: pl.Trainer = instantiate(cfg.trainer)

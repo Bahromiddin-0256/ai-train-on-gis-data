@@ -130,6 +130,18 @@ def _wkt_to_geojson_geom(wkt_str: str) -> dict:
     show_default=True,
     help="Randomly sample this many polygons per class (0 = no limit, use --limit instead).",
 )
+@click.option(
+    "--drop-id",
+    is_flag=True,
+    default=False,
+    help="Omit Mongo _id and debug props — write only {crop_type} (legacy schema).",
+)
+@click.option(
+    "--seed",
+    type=int,
+    default=None,
+    help="Seed the per-class random sampler (required for reproducible backfills).",
+)
 def main(
     uri: str,
     db: str,
@@ -143,6 +155,8 @@ def main(
     tuman_code: int,
     exclude_tuman_code: str,
     per_class: int,
+    drop_id: bool,
+    seed: int | None,
 ) -> None:
     """Export MongoDB crop polygons to a GeoJSON FeatureCollection."""
     try:
@@ -166,7 +180,10 @@ def main(
         codes = [int(c.strip()) for c in exclude_tuman_code.split(",") if c.strip()]
         query["tuman_code"] = {"$nin": codes}
 
-    projection = {geom_field: 1, label_field: 1, "_id": 0}
+    projection = {geom_field: 1, label_field: 1, "_id": 1}
+    if not drop_id:
+        # Optional debugging fields — carried through to downstream consumers.
+        projection.update({"fid": 1, "tuman_code": 1, "viloyat": 1})
     cursor = col.find(query, projection)
     total = col.count_documents(query)
     if limit:
@@ -195,13 +212,20 @@ def main(
             continue
 
         label = _primary(str(raw_label))
-        features.append(
-            {
-                "type": "Feature",
-                "geometry": geom_dict,
-                "properties": {label_field: label},
-            }
-        )
+        props: dict = {label_field: label}
+        feature: dict = {
+            "type": "Feature",
+            "geometry": geom_dict,
+            "properties": props,
+        }
+        if not drop_id:
+            oid = str(doc["_id"])
+            feature["id"] = oid            # top-level GeoJSON id
+            props["_id"] = oid             # mirrored into properties for geopandas
+            for extra in ("fid", "tuman_code", "viloyat"):
+                if extra in doc and doc[extra] is not None:
+                    props[extra] = doc[extra]
+        features.append(feature)
 
     _log.info("exported %d features, skipped %d", len(features), skipped)
 
@@ -210,13 +234,15 @@ def main(
         import random
         from collections import defaultdict
 
+        rng = random.Random(seed) if seed is not None else random
+
         by_class: dict[str, list[dict]] = defaultdict(list)
         for f in features:
             by_class[f["properties"][label_field]].append(f)
 
         sampled: list[dict] = []
         for cls, items in sorted(by_class.items()):
-            chosen = random.sample(items, min(per_class, len(items)))
+            chosen = rng.sample(items, min(per_class, len(items)))
             sampled.extend(chosen)
             _log.info("class %r: sampled %d / %d", cls, len(chosen), len(items))
         features = sampled

@@ -15,11 +15,15 @@ Recommended invocation::
         --data-dir data/processed_regional_mt \\
         --bands B02,B03,B04,B05,B06,B07,B08,B11,B12 \\
         --indices ndvi,evi,ndwi,ndre,msi,nbr \\
-        --n-windows 3
+        --n-windows 3 \\
+        --workers 0
 """
 
 from __future__ import annotations
 
+import math
+import os
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 
 import click
@@ -208,6 +212,46 @@ def get_band_names(bands: list[str] | None = None, n_windows: int = 3) -> list[s
 
 
 # ---------------------------------------------------------------------------
+# Parallel worker
+# ---------------------------------------------------------------------------
+
+def _process_chunk(
+    images_path: str,
+    start: int,
+    end: int,
+    raw_bands: list[str],
+    index_names: list[str],
+    n_windows: int,
+    aug_bands: list[str],
+    all_band_names: list[str],
+) -> list[dict[str, float]]:
+    """Worker function: extract features for patches[start:end].
+
+    Re-opens the numpy file with mmap so multiple workers share the OS
+    page cache without IPC copies.
+    """
+    images = np.load(images_path, mmap_mode="r")
+    bands_per_window = len(aug_bands)
+    results: list[dict[str, float]] = []
+
+    for idx in range(start, end):
+        patch = images[idx]
+        aug_patch, _ = augment_with_indices(
+            patch, raw_bands, n_windows, index_names,
+        )
+        features = extract_features_from_patch(aug_patch, all_band_names)
+        temporal = extract_temporal_features(
+            aug_patch, n_windows, bands_per_window, aug_bands=aug_bands,
+        )
+        ndvi_stats = compute_ndvi_temporal_stats(aug_patch, all_band_names)
+        features.update(temporal)
+        features.update(ndvi_stats)
+        results.append(features)
+
+    return results
+
+
+# ---------------------------------------------------------------------------
 # Main extraction loop
 # ---------------------------------------------------------------------------
 
@@ -217,6 +261,8 @@ def extract_features(
     index_names: list[str] | None = None,
     n_windows: int = 3,
     verbose: bool = True,
+    n_workers: int = 1,
+    images_path: Path | None = None,
 ) -> pd.DataFrame:
     """Extract full feature matrix from all image patches.
 
@@ -231,6 +277,11 @@ def extract_features(
         Spectral indices to compute on-the-fly per time window.
     n_windows:
         Number of temporal windows.
+    n_workers:
+        Number of parallel worker processes.  ``1`` runs sequentially.
+    images_path:
+        Path to the ``.npy`` file on disk.  Required when ``n_workers > 1``
+        so that workers can re-open the memory-mapped file independently.
 
     Returns
     -------
@@ -239,27 +290,76 @@ def extract_features(
     if raw_bands is None:
         raw_bands = ["B02", "B03", "B04", "B05", "B06", "B07", "B08", "B11", "B12"]
 
-    all_features: list[dict[str, float]] = []
+    index_names = index_names or []
 
     # Run augmentation once on the first patch to get the final band list.
-    sample_aug, aug_bands = augment_with_indices(
-        images[0], raw_bands, n_windows, index_names or []
+    _sample_aug, aug_bands = augment_with_indices(
+        images[0], raw_bands, n_windows, index_names,
     )
     all_band_names = get_band_names(aug_bands, n_windows)
 
+    N = len(images)
+
+    # ----- parallel path -----
+    if n_workers > 1 and images_path is not None:
+        n_chunks = min(N, n_workers * 2)  # 2× workers for load balancing
+        chunk_size = math.ceil(N / n_chunks)
+        chunks = [
+            (i, min(i + chunk_size, N))
+            for i in range(0, N, chunk_size)
+        ]
+
+        all_features: list[dict[str, float]] = [None] * N  # type: ignore[list-item]
+        images_path_str = str(images_path)
+
+        if verbose:
+            click.echo(
+                f"Parallel extraction: {n_workers} workers, "
+                f"{len(chunks)} chunks, ~{chunk_size} patches/chunk"
+            )
+
+        pbar = tqdm(total=N, desc="Extracting features", disable=not verbose)
+
+        with ProcessPoolExecutor(max_workers=n_workers) as executor:
+            future_to_range = {}
+            for start, end in chunks:
+                fut = executor.submit(
+                    _process_chunk,
+                    images_path_str, start, end,
+                    raw_bands, index_names, n_windows,
+                    aug_bands, all_band_names,
+                )
+                future_to_range[fut] = (start, end)
+
+            for fut in as_completed(future_to_range):
+                start, end = future_to_range[fut]
+                chunk_results = fut.result()  # propagates worker exceptions
+                for j, feat in enumerate(chunk_results):
+                    all_features[start + j] = feat
+                pbar.update(end - start)
+
+        pbar.close()
+        return pd.DataFrame(all_features)
+
+    # ----- sequential path (n_workers == 1 or no images_path) -----
+    all_features_seq: list[dict[str, float]] = []
+    bands_per_window = len(aug_bands)
+
     iterator = tqdm(images, desc="Extracting features") if verbose else images
     for patch in iterator:
-        aug_patch, _ = augment_with_indices(patch, raw_bands, n_windows, index_names or [])
+        aug_patch, _ = augment_with_indices(patch, raw_bands, n_windows, index_names)
 
         features = extract_features_from_patch(aug_patch, all_band_names)
-        temporal = extract_temporal_features(aug_patch, n_windows, len(aug_bands), aug_bands=aug_bands)
+        temporal = extract_temporal_features(
+            aug_patch, n_windows, bands_per_window, aug_bands=aug_bands,
+        )
         ndvi_stats = compute_ndvi_temporal_stats(aug_patch, all_band_names)
 
         features.update(temporal)
         features.update(ndvi_stats)
-        all_features.append(features)
+        all_features_seq.append(features)
 
-    return pd.DataFrame(all_features)
+    return pd.DataFrame(all_features_seq)
 
 
 # ---------------------------------------------------------------------------
@@ -305,6 +405,13 @@ def extract_features(
     default=None,
     help="Only extract features for first N samples (for testing).",
 )
+@click.option(
+    "--workers",
+    type=int,
+    default=0,
+    show_default=True,
+    help="Parallel workers. 0=auto (min(cpu_count, 8)), 1=sequential.",
+)
 def main(
     data_dir: Path,
     output: Path | None,
@@ -312,6 +419,7 @@ def main(
     bands: str,
     indices: str,
     sample_size: int | None,
+    workers: int,
 ) -> None:
     """Extract features from multi-temporal image patches for XGBoost training."""
     images_path = data_dir / "images.npy"
@@ -336,9 +444,14 @@ def main(
     raw_band_list = [b.strip() for b in bands.split(",") if b.strip()]
     index_list = [i.strip() for i in indices.split(",") if i.strip()] if indices else []
 
+    # Resolve worker count
+    if workers == 0:
+        workers = min(os.cpu_count() or 1, 8)
+
     click.echo(f"Raw bands ({len(raw_band_list)}): {raw_band_list}")
     click.echo(f"Computed indices ({len(index_list)}): {index_list}")
     click.echo(f"Temporal windows: {n_windows}")
+    click.echo(f"Workers: {workers}")
 
     click.echo("Extracting features...")
     features_df = extract_features(
@@ -346,6 +459,8 @@ def main(
         raw_bands=raw_band_list,
         index_names=index_list,
         n_windows=n_windows,
+        n_workers=workers,
+        images_path=images_path,
     )
     features_df["label"] = labels[: len(features_df)]
 

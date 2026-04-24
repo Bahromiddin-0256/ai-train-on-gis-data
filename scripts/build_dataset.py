@@ -99,15 +99,17 @@ def _combine(processed_base: Path, out: Path) -> None:
         raise click.ClickException(f"No processed_tuman_* dirs found under {processed_base}")
 
     # Pass 1: inspect each tuman to determine total size and chip shape.
-    plan: list[tuple[Path, Path, int]] = []
+    plan: list[tuple[Path, Path, Path | None, int]] = []
     total_n = 0
     chip_shape: tuple[int, ...] | None = None
     chip_dtype = None
     label_dtype = None
+    all_have_ids = True
 
     for d in tuman_dirs:
         imgs_path = d / "images.npy"
         lbls_path = d / "labels.npy"
+        ids_path = d / "ids.npy"
         if not imgs_path.exists() or not lbls_path.exists():
             click.echo(f"  [skip] {d.name} — missing images.npy / labels.npy")
             continue
@@ -125,9 +127,14 @@ def _combine(processed_base: Path, out: Path) -> None:
             raise click.ClickException(
                 f"shape mismatch at {d.name}: expected (*,{chip_shape}), got {imgs_header.shape}"
             )
-        plan.append((imgs_path, lbls_path, n))
+        has_ids = ids_path.exists()
+        if has_ids and int(np.load(ids_path, allow_pickle=True).shape[0]) != n:
+            click.echo(f"  [skip-ids] {d.name} — ids.npy length mismatch; omitting ids")
+            has_ids = False
+        all_have_ids = all_have_ids and has_ids
+        plan.append((imgs_path, lbls_path, ids_path if has_ids else None, n))
         total_n += n
-        click.echo(f"  + {d.name}: {n:,} chips")
+        click.echo(f"  + {d.name}: {n:,} chips{' (+ids)' if has_ids else ''}")
 
     if not plan or chip_shape is None:
         raise click.ClickException("Nothing to combine — all dirs were skipped.")
@@ -135,6 +142,7 @@ def _combine(processed_base: Path, out: Path) -> None:
     out.mkdir(parents=True, exist_ok=True)
     out_imgs_path = out / "images.npy"
     out_lbls_path = out / "labels.npy"
+    out_ids_path = out / "ids.npy"
     click.echo(
         f"\nAllocating output: images=({total_n},{chip_shape}) dtype={chip_dtype}, "
         f"labels=({total_n},) dtype={label_dtype}"
@@ -145,20 +153,35 @@ def _combine(processed_base: Path, out: Path) -> None:
     out_lbls = np.lib.format.open_memmap(
         out_lbls_path, mode="w+", dtype=label_dtype, shape=(total_n,),
     )
+    # ids.npy holds Python strings (object dtype) — too variable-length for memmap;
+    # build it in-memory (~100 bytes/row worst case, trivial for 74k rows).
+    combined_ids: np.ndarray | None = (
+        np.empty(total_n, dtype=object) if all_have_ids else None
+    )
 
     # Pass 2: stream each tuman into the preallocated memmap.
     offset = 0
-    for imgs_path, lbls_path, n in plan:
+    for imgs_path, lbls_path, ids_path, n in plan:
         imgs = np.load(imgs_path, mmap_mode="r")
         lbls = np.load(lbls_path, mmap_mode="r")
         out_imgs[offset:offset + n] = imgs
         out_lbls[offset:offset + n] = lbls
+        if combined_ids is not None and ids_path is not None:
+            combined_ids[offset:offset + n] = np.load(ids_path, allow_pickle=True)
         offset += n
         del imgs, lbls  # release mmap handles
     assert offset == total_n, (offset, total_n)
     out_imgs.flush()
     out_lbls.flush()
     del out_imgs, out_lbls
+    if combined_ids is not None:
+        np.save(out_ids_path, combined_ids)
+        click.echo(f"  wrote combined ids.npy → {out_ids_path}")
+    elif not all_have_ids:
+        click.echo(
+            "  (some tumans missing ids.npy — combined ids.npy not written; "
+            "re-export those tumans with the updated export_mongodb.py to populate)"
+        )
 
     click.echo(f"\nCombined dataset → {out}/")
     click.echo(f"  Total chips : {total_n:,}")

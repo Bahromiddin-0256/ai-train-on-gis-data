@@ -434,6 +434,8 @@ def main(
         gdf["class_idx"] = gdf[class_field].map(class_to_idx)
         gdf = gdf[gdf["class_idx"].notna()].copy()
 
+        has_ids = "_id" in gdf.columns
+
         if date_windows is not None:
             from gis_train.data.download import fetch_chips_multitemporal
 
@@ -450,7 +452,7 @@ def main(
                     )
                 windows.append((parts[0].strip(), parts[1].strip()))
 
-            chips, label_list = fetch_chips_multitemporal(
+            chips, label_list, kept_indices = fetch_chips_multitemporal(
                 gdf=gdf,
                 bands=band_list,
                 date_windows=windows,
@@ -459,11 +461,12 @@ def main(
                 indices=index_list,
                 num_proc=num_proc,
                 num_threads=num_threads,
+                return_indices=True,
             )
         else:
             from gis_train.data.download import fetch_chips_from_stac
 
-            chips, label_list = fetch_chips_from_stac(
+            chips, label_list, kept_indices = fetch_chips_from_stac(
                 gdf=gdf,
                 bands=band_list,
                 date_start=date_start,
@@ -472,6 +475,7 @@ def main(
                 min_native_px=min_pixels,
                 num_proc=num_proc,
                 num_threads=num_threads,
+                return_indices=True,
             )
 
         if not chips:
@@ -479,6 +483,10 @@ def main(
 
         images_arr = np.stack(chips).astype(np.float32)
         labels_arr = np.asarray(label_list, dtype=np.int64)
+        ids_arr: np.ndarray | None = (
+            np.asarray([str(gdf.loc[i, "_id"]) for i in kept_indices], dtype=object)
+            if has_ids else None
+        )
 
     # -----------------------------------------------------------------------
     # Mode B: read from pre-downloaded local tiles
@@ -557,6 +565,7 @@ def main(
 
         images = [chip for _, status, chip, _ in results if status == "ok" and chip is not None]
         labels = [label for _, status, _, label in results if status == "ok" and label is not None]
+        kept_indices = [idx for idx, status, _, _ in results if status == "ok"]
         skipped_no_scene = sum(1 for _, status, _, _ in results if status == "no_scene")
         skipped_small = sum(1 for _, status, _, _ in results if status == "too_small")
         skipped_label = sum(1 for _, status, _, _ in results if status == "no_label")
@@ -566,6 +575,11 @@ def main(
 
         images_arr = np.stack(images).astype(np.float32)
         labels_arr = np.asarray(labels, dtype=np.int64)
+        has_ids = "_id" in gdf.columns
+        ids_arr = (
+            np.asarray([str(gdf.loc[i, "_id"]) for i in kept_indices], dtype=object)
+            if has_ids else None
+        )
 
         click.echo(f"  skipped : {skipped_no_scene} (no scene), "
                    f"{skipped_small} (too small), {skipped_label} (no label)")
@@ -576,6 +590,9 @@ def main(
     out.mkdir(parents=True, exist_ok=True)
     np.save(out / "images.npy", images_arr)
     np.save(out / "labels.npy", labels_arr)
+    if ids_arr is not None:
+        np.save(out / "ids.npy", ids_arr)
+        click.echo(f"  ids     : wrote {len(ids_arr)} mongo _ids → {out}/ids.npy")
 
     click.echo(f"\nwrote {len(images_arr)} chips → {out}/")
     click.echo(f"  shape   : {images_arr.shape}")

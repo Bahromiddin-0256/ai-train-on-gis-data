@@ -172,10 +172,10 @@ def _extract_scene_chips(
     bands: Sequence[str],
     chip_size: int,
     min_native_px: int,
-) -> tuple[list[np.ndarray], list[int], int]:
+) -> tuple[list[np.ndarray], list[int], list[int], int]:
     """Extract chips for all polygons in a single scene.
 
-    Returns (chips, labels, skipped_small_count).
+    Returns (chips, labels, kept_indices, skipped_small_count).
     """
     import numpy as np
     import torch
@@ -210,13 +210,14 @@ def _extract_scene_chips(
 
     chips: list[np.ndarray] = []
     labels: list[int] = []
+    kept_indices: list[int] = []
     skipped_small = 0
 
     try:
         band_srcs = [rasterio.open(hrefs[b]) for b in bands]
     except Exception as exc:
         _log.warning("Cannot open scene %s: %s", scene_id, exc)
-        return chips, labels, skipped_small
+        return chips, labels, kept_indices, skipped_small
 
     try:
         for idx in poly_indices:
@@ -243,11 +244,12 @@ def _extract_scene_chips(
             )
             chips.append(resized.squeeze(0).numpy())
             labels.append(int(row["class_idx"]))
+            kept_indices.append(int(idx))
     finally:
         for src in band_srcs:
             src.close()
 
-    return chips, labels, skipped_small
+    return chips, labels, kept_indices, skipped_small
 
 
 def fetch_chips_from_stac(
@@ -260,7 +262,8 @@ def fetch_chips_from_stac(
     min_native_px: int = 4,
     num_proc: int = 1,
     num_threads: int = 1,
-) -> tuple[list, list[int]]:
+    return_indices: bool = False,
+) -> tuple[list, list[int]] | tuple[list, list[int], list[int]]:
     """Read per-polygon chips directly from Planetary Computer COGs (no tile download).
 
     Scene-first approach — O(scenes) STAC queries instead of O(polygons):
@@ -317,7 +320,7 @@ def fetch_chips_from_stac(
 
     if not all_items:
         _log.warning("No scenes found — check date range and cloud_cover_max")
-        return [], []
+        return ([], [], []) if return_indices else ([], [])
 
     # ------------------------------------------------------------------
     # Step 2: build scene bbox index (WGS-84)
@@ -390,6 +393,7 @@ def fetch_chips_from_stac(
 
     chips: list[np.ndarray] = []
     labels: list[int] = []
+    kept_indices: list[int] = []
     skipped_small = 0
 
     # Prepare scene data for parallel processing
@@ -405,7 +409,7 @@ def fetch_chips_from_stac(
     if num_threads <= 1:
         # Sequential processing
         for scene_id, poly_indices, hrefs in tqdm(scene_data, desc="scenes", unit="scene"):
-            scene_chips, scene_labels, scene_skipped = _extract_scene_chips(
+            scene_chips, scene_labels, scene_kept, scene_skipped = _extract_scene_chips(
                 scene_id=scene_id,
                 poly_indices=poly_indices,
                 hrefs=hrefs,
@@ -416,6 +420,7 @@ def fetch_chips_from_stac(
             )
             chips.extend(scene_chips)
             labels.extend(scene_labels)
+            kept_indices.extend(scene_kept)
             skipped_small += scene_skipped
     else:
         # Thread-parallel processing across scenes
@@ -438,16 +443,19 @@ def fetch_chips_from_stac(
         with ThreadPoolExecutor(max_workers=num_threads) as pool:
             futures = {pool.submit(_process_scene_thread, sd): sd[0] for sd in scene_data}
             for future in tqdm(as_completed(futures), total=len(futures), desc="scenes", unit="scene"):
-                scene_chips, scene_labels, scene_skipped = future.result()
+                scene_chips, scene_labels, scene_kept, scene_skipped = future.result()
                 with chips_lock:
                     chips.extend(scene_chips)
                     labels.extend(scene_labels)
+                    kept_indices.extend(scene_kept)
                     skipped_small += scene_skipped
 
     _log.info(
         "Done: %d chips (skipped %d no-scene, %d too-small)",
         len(chips), skipped_no_scene, skipped_small,
     )
+    if return_indices:
+        return chips, labels, kept_indices
     return chips, labels
 
 
@@ -695,7 +703,8 @@ def fetch_chips_multitemporal(
     max_missing_windows: int = 1,
     num_proc: int = 1,
     num_threads: int = 1,
-) -> tuple[list, list[int]]:
+    return_indices: bool = False,
+) -> tuple[list, list[int]] | tuple[list, list[int], list[int]]:
     """Fetch per-polygon chips across multiple time windows.
 
     For each polygon: collects chips from each window, concatenates along
@@ -785,6 +794,7 @@ def fetch_chips_multitemporal(
 
     chips: list[np.ndarray] = []
     labels: list[int] = []
+    kept_indices: list[int] = []
 
     for poly_idx in sorted(all_poly_indices):
         missing = sum(1 for wr in window_results if poly_idx not in wr)
@@ -797,11 +807,14 @@ def fetch_chips_multitemporal(
         combined = np.concatenate(window_chips_list, axis=0)  # (n_windows * C, H, W)
         chips.append(combined)
         labels.append(int(gdf.loc[poly_idx, "class_idx"]))
+        kept_indices.append(int(poly_idx))
 
     _log.info(
         "Multi-temporal done: %d chips from %d windows × %d ch/window",
         len(chips), len(date_windows), n_channels_per_window,
     )
+    if return_indices:
+        return chips, labels, kept_indices
     return chips, labels
 
 
