@@ -59,8 +59,6 @@ image_size: 64
 batch_size: 256
 num_workers: 8
 pin_memory: true
-prefetch_factor: 4
-persistent_workers: true
 
 # Train/val/test fractions (used when upstream data has no explicit split).
 val_split: 0.15

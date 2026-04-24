@@ -249,6 +249,7 @@ class CropDataModule(pl.LightningDataModule):
             pin_memory=self.pin_memory,
             drop_last=shuffle,
             persistent_workers=self.num_workers > 0,
+            prefetch_factor=4 if self.num_workers > 0 else None,
             collate_fn=collate_fn,
         )
 
