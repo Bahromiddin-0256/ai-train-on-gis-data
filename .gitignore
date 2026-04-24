@@ -72,18 +72,7 @@ venv.bak/
 Thumbs.db
 
 # Project-specific
-data/raw/
-data/processed/
-data/processed*
-data/v6win/*
-data/tuman*
-data/labels/
-data/interim/
-data/external/
-data/*.tif
-data/*.tiff
-data/*.nc
-data/*.h5
+data/*
 outputs/
 lightning_logs/
 wandb/
