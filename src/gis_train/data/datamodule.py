@@ -293,13 +293,20 @@ class CropDataModule(pl.LightningDataModule):
             )
 
         if self.source == "local":
-            images_path = self.data_dir / "images.npy"
             labels_path = self.data_dir / "labels.npy"
-            if not images_path.exists() or not labels_path.exists():
+            f16_path = self.data_dir / "images_f16.npy"
+            f32_path = self.data_dir / "images.npy"
+            if f16_path.exists():
+                images_path = f16_path
+            elif f32_path.exists():
+                images_path = f32_path
+            else:
                 raise FileNotFoundError(
-                    f"expected {images_path} and {labels_path}; run "
+                    f"expected {f16_path} or {f32_path}; run "
                     "`python scripts/prepare_labels.py` first"
                 )
+            if not labels_path.exists():
+                raise FileNotFoundError(f"expected {labels_path}")
             return np.load(images_path, mmap_mode="r"), np.load(labels_path)
 
         if self.source == "cropharvest":

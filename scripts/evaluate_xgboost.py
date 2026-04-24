@@ -192,7 +192,20 @@ def main(
             "(includes training data — metrics will be inflated)."
         )
 
-    feature_cols = [c for c in df.columns if c != target_col]
+    # Use the exact feature list the model was trained on (handles top-N selection).
+    model_features = list(model.feature_names) if model.feature_names else None
+    if model_features is not None:
+        missing = [c for c in model_features if c not in df.columns]
+        if missing:
+            raise ValueError(
+                f"Features CSV is missing {len(missing)} columns the model expects: "
+                f"{missing[:10]}{'...' if len(missing) > 10 else ''}"
+            )
+        feature_cols = model_features
+    else:
+        non_feature_cols = {target_col, "tuman_code"}
+        feature_cols = [c for c in df.columns if c not in non_feature_cols]
+
     features = df[feature_cols].values
     labels = df[target_col].values
 

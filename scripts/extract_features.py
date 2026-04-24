@@ -464,6 +464,26 @@ def main(
     )
     features_df["label"] = labels[: len(features_df)]
 
+    # Attach tuman_code if ids.npy exists alongside the data.
+    # ids.npy contains MongoDB field IDs; we map them back to tuman codes
+    # by scanning processed_tuman_* sibling directories.
+    ids_path = data_dir / "ids.npy"
+    if ids_path.exists():
+        chip_ids = np.load(ids_path, allow_pickle=True)[: len(features_df)]
+        id_to_tuman: dict[str, int] = {}
+        for tuman_dir in sorted(data_dir.parent.glob("**/processed_tuman_*_mt")):
+            t_ids_path = tuman_dir / "ids.npy"
+            if t_ids_path.exists():
+                tcode = int(tuman_dir.name.split("_")[2])
+                for tid in np.load(t_ids_path, allow_pickle=True):
+                    id_to_tuman[str(tid)] = tcode
+        if id_to_tuman:
+            features_df["tuman_code"] = [id_to_tuman.get(str(i), -1) for i in chip_ids]
+            n_mapped = (features_df["tuman_code"] != -1).sum()
+            click.echo(f"tuman_code mapped: {n_mapped}/{len(features_df)} chips")
+        else:
+            click.echo("No processed_tuman_* dirs found — tuman_code not added")
+
     if output is None:
         output = data_dir / "features.csv"
     output.parent.mkdir(parents=True, exist_ok=True)

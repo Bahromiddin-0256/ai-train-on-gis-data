@@ -24,54 +24,104 @@ from sklearn.metrics import (
 from sklearn.model_selection import StratifiedKFold, train_test_split
 
 
-def prepare_data(
-    features_path: Path,
+def prepare_data_random(
+    df: pd.DataFrame,
     target_col: str = "label",
     test_size: float = 0.15,
     val_size: float = 0.15,
     random_state: int = 42,
-) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, list[str]]:
-    """Load and split data into train/val/test sets.
-
-    Args:
-        features_path: Path to features CSV
-        target_col: Name of target column
-        test_size: Fraction for test set
-        val_size: Fraction for validation set (from remaining data)
-        random_state: Random seed
-
-    Returns:
-        Tuple of (train_df, val_df, test_df, feature_names)
-    """
-    df = pd.read_csv(features_path)
-
-    # Get feature columns (exclude label)
-    feature_cols = [c for c in df.columns if c != target_col]
-
-    # First split: separate test set
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    """Random stratified train/val/test split."""
     train_val_df, test_df = train_test_split(
-        df,
-        test_size=test_size,
-        stratify=df[target_col],
-        random_state=random_state,
+        df, test_size=test_size, stratify=df[target_col], random_state=random_state,
     )
-
-    # Second split: separate val from train
-    # Adjust val_size to account for already removed test set
     adjusted_val_size = val_size / (1 - test_size)
     train_df, val_df = train_test_split(
-        train_val_df,
-        test_size=adjusted_val_size,
-        stratify=train_val_df[target_col],
-        random_state=random_state,
+        train_val_df, test_size=adjusted_val_size,
+        stratify=train_val_df[target_col], random_state=random_state,
     )
+    return train_df, val_df, test_df
 
-    click.echo(f"Train samples: {len(train_df)}")
-    click.echo(f"Val samples: {len(val_df)}")
-    click.echo(f"Test samples: {len(test_df)}")
-    click.echo(f"Features: {len(feature_cols)}")
 
+def prepare_data_geo(
+    df: pd.DataFrame,
+    target_col: str = "label",
+    tuman_col: str = "tuman_code",
+    random_state: int = 42,
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    """Geographic split: hold out 1 tuman per viloyat for test, 1 for val.
+
+    Viloyat is identified by the first 4 digits of tuman_code.
+    Within each viloyat, tumans are ranked by sample count descending.
+    The largest tuman → test, second largest → val, rest → train.
+    This ensures test/val contain enough samples and come from unseen geography.
+    """
+    from collections import defaultdict
+
+    by_viloyat: dict[int, list[int]] = defaultdict(list)
+    tuman_counts = df[tuman_col].value_counts()
+    for tcode, count in tuman_counts.items():
+        vil = int(str(int(tcode))[:4])
+        by_viloyat[vil].append(int(tcode))
+
+    test_tumans, val_tumans = set(), set()
+    for vil, tcodes in by_viloyat.items():
+        ranked = sorted(tcodes, key=lambda c: tuman_counts[c], reverse=True)
+        test_tumans.add(ranked[0])
+        if len(ranked) > 1:
+            val_tumans.add(ranked[1])
+
+    test_df  = df[df[tuman_col].isin(test_tumans)]
+    val_df   = df[df[tuman_col].isin(val_tumans)]
+    train_df = df[~df[tuman_col].isin(test_tumans | val_tumans)]
+
+    click.echo(f"\nGeographic split:")
+    click.echo(f"  Test tumans  ({len(test_tumans)}): {sorted(test_tumans)}")
+    click.echo(f"  Val tumans   ({len(val_tumans)}): {sorted(val_tumans)}")
+    click.echo(f"  Train tumans ({len(by_viloyat) * max(0, max(len(v) for v in by_viloyat.values()) - 2)} approx)")
+    return train_df, val_df, test_df
+
+
+def prepare_data(
+    features_path: Path,
+    target_col: str = "label",
+    tuman_col: str = "tuman_code",
+    test_size: float = 0.15,
+    val_size: float = 0.15,
+    geo_split: bool = False,
+    random_state: int = 42,
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, list[str]]:
+    """Load and split data into train/val/test sets."""
+    df = pd.read_csv(features_path)
+
+    meta_cols = {target_col, tuman_col}
+    feature_cols = [c for c in df.columns if c not in meta_cols]
+
+    if geo_split:
+        if tuman_col not in df.columns:
+            raise click.ClickException(
+                f"--geo-split requires '{tuman_col}' column in features CSV. "
+                "Re-run extract_features.py to generate it."
+            )
+        train_df, val_df, test_df = prepare_data_geo(df, target_col, tuman_col, random_state)
+    else:
+        train_df, val_df, test_df = prepare_data_random(df, target_col, test_size, val_size, random_state)
+
+    click.echo(f"Train: {len(train_df):,}  Val: {len(val_df):,}  Test: {len(test_df):,}  Features: {len(feature_cols)}")
     return train_df, val_df, test_df, feature_cols
+
+
+def select_top_features(
+    model: xgb.Booster,
+    feature_cols: list[str],
+    top_n: int,
+) -> list[str]:
+    """Return top-N features by gain importance."""
+    importance = model.get_score(importance_type="gain")
+    ranked = sorted(importance.items(), key=lambda x: x[1], reverse=True)
+    selected = [f for f, _ in ranked[:top_n] if f in feature_cols]
+    click.echo(f"Feature selection: {len(feature_cols)} → {len(selected)} (top-{top_n} by gain)")
+    return selected
 
 
 def get_class_weights(y: np.ndarray) -> dict[int, float]:
@@ -267,60 +317,18 @@ def cross_validate(
     default=0.15,
     help="Fraction of data for validation set (default: 0.15)",
 )
-@click.option(
-    "--max-depth",
-    type=int,
-    default=8,
-    help="Maximum tree depth (default: 8)",
-)
-@click.option(
-    "--learning-rate",
-    type=float,
-    default=0.05,
-    help="Learning rate (default: 0.05)",
-)
-@click.option(
-    "--n-estimators",
-    type=int,
-    default=1000,
-    help="Number of boosting rounds (default: 1000)",
-)
-@click.option(
-    "--subsample",
-    type=float,
-    default=0.8,
-    help="Subsample ratio (default: 0.8)",
-)
-@click.option(
-    "--colsample-bytree",
-    type=float,
-    default=0.8,
-    help="Column sample ratio (default: 0.8)",
-)
-@click.option(
-    "--min-child-weight",
-    type=int,
-    default=3,
-    help="Minimum child weight (default: 3)",
-)
-@click.option(
-    "--gamma",
-    type=float,
-    default=0.1,
-    help="Minimum loss reduction for split (default: 0.1)",
-)
-@click.option(
-    "--reg-alpha",
-    type=float,
-    default=0.1,
-    help="L1 regularization (default: 0.1)",
-)
-@click.option(
-    "--reg-lambda",
-    type=float,
-    default=1.0,
-    help="L2 regularization (default: 1.0)",
-)
+@click.option("--max-depth", type=int, default=5, show_default=True,
+              help="Maximum tree depth.")
+@click.option("--learning-rate", type=float, default=0.05, show_default=True)
+@click.option("--n-estimators", type=int, default=1000, show_default=True)
+@click.option("--subsample", type=float, default=0.6, show_default=True)
+@click.option("--colsample-bytree", type=float, default=0.5, show_default=True)
+@click.option("--min-child-weight", type=int, default=10, show_default=True)
+@click.option("--gamma", type=float, default=0.1, show_default=True)
+@click.option("--reg-alpha", type=float, default=1.0, show_default=True,
+              help="L1 regularization.")
+@click.option("--reg-lambda", type=float, default=5.0, show_default=True,
+              help="L2 regularization.")
 @click.option(
     "--num-class",
     type=int,
@@ -333,36 +341,15 @@ def cross_validate(
     default="bugdoy,other,paxta",
     help="Comma-separated class names",
 )
-@click.option(
-    "--cv",
-    is_flag=True,
-    help="Run cross-validation before final training",
-)
-@click.option(
-    "--cv-folds",
-    type=int,
-    default=5,
-    help="Number of CV folds (default: 5)",
-)
-@click.option(
-    "--seed",
-    type=int,
-    default=42,
-    help="Random seed (default: 42)",
-)
-@click.option(
-    "--early-stopping",
-    type=int,
-    default=50,
-    help="Early stopping rounds (default: 50)",
-)
-@click.option(
-    "--device",
-    type=click.Choice(["cuda", "cpu"]),
-    default="cuda",
-    show_default=True,
-    help="Device for XGBoost tree building (cuda uses GPU).",
-)
+@click.option("--cv", is_flag=True, help="Run cross-validation before final training.")
+@click.option("--cv-folds", type=int, default=5, show_default=True)
+@click.option("--seed", type=int, default=42, show_default=True)
+@click.option("--early-stopping", type=int, default=50, show_default=True)
+@click.option("--device", type=click.Choice(["cuda", "cpu"]), default="cuda", show_default=True)
+@click.option("--geo-split", is_flag=True, default=False,
+              help="Geographic split: hold out 1 tuman/viloyat for test, 1 for val.")
+@click.option("--top-features", type=int, default=0, show_default=True,
+              help="Keep only top-N features by gain importance. 0 = use all.")
 def main(
     features: Path,
     output_dir: Path,
@@ -384,6 +371,8 @@ def main(
     seed: int,
     early_stopping: int,
     device: str,
+    geo_split: bool,
+    top_features: int,
 ) -> None:
     """Train XGBoost model on extracted features."""
     output_dir = Path(output_dir)
@@ -391,6 +380,7 @@ def main(
 
     class_names_list = class_names.split(",")
     click.echo(f"Class names: {class_names_list}")
+    click.echo(f"Split strategy: {'geographic (tuman-level)' if geo_split else 'random stratified'}")
 
     # Load and split data
     click.echo("Loading data...")
@@ -398,6 +388,7 @@ def main(
         features,
         test_size=test_size,
         val_size=val_size,
+        geo_split=geo_split,
         random_state=seed,
     )
 
@@ -445,12 +436,23 @@ def main(
         with open(output_dir / "cv_results.json", "w") as f:
             json.dump(cv_results, f, indent=2)
 
-    # Final training on train+val, evaluate on test
+    # Phase 1: train on train-only to get feature importances for selection
+    click.echo("\nTraining phase 1 (feature selection)...")
+    model_phase1 = train_model(
+        train_df, val_df, feature_cols, "label", params,
+        num_boost_round=n_estimators,
+        early_stopping_rounds=early_stopping,
+        verbose_eval=100,
+    )
+    if top_features > 0:
+        feature_cols = select_top_features(model_phase1, feature_cols, top_features)
+
+    # Phase 2: final training with selected features
     click.echo("\nTraining final model...")
     combined_train = pd.concat([train_df, val_df])
     model = train_model(
         combined_train,
-        val_df,  # Use val for early stopping
+        val_df,
         feature_cols,
         "label",
         params,

@@ -22,29 +22,32 @@ echo "Data directory: $DATA_DIR"
 echo "Output directory: $OUTPUT_DIR"
 echo ""
 
-# Step 1: Extract features
+# Step 1: Extract features (with tuman_code for geographic split)
 echo "Step 1: Extracting features..."
 #python scripts/extract_features.py \
 #    --data-dir "$DATA_DIR" \
 #    --output "$OUTPUT_DIR/features.csv" \
 #    --n-windows 6 \
 #    --bands "B02,B03,B04,B05,B06,B07,B08,B11,B12" \
-#    --indices "ndvi,evi,ndwi,ndre,msi,nbr"
+#    --indices "ndvi,evi,ndwi,ndre,msi,nbr" \
+#    --workers 8
 
-# Step 2: Train model
+# Step 2: Train model (geographic split + tight regularisation + feature selection)
 echo ""
 echo "Step 2: Training XGBoost model..."
 python scripts/train_xgboost.py \
     --features "$OUTPUT_DIR/features.csv" \
     --output-dir "$OUTPUT_DIR" \
-    --test-size 0.15 \
-    --val-size 0.15 \
-    --max-depth 8 \
+    --geo-split \
+    --top-features 200 \
+    --max-depth 5 \
     --learning-rate 0.05 \
     --n-estimators 1000 \
-    --subsample 0.8 \
-    --colsample-bytree 0.8 \
-    --min-child-weight 3 \
+    --subsample 0.6 \
+    --colsample-bytree 0.5 \
+    --min-child-weight 10 \
+    --reg-alpha 1.0 \
+    --reg-lambda 5.0 \
     --class-names "bugdoy,other,paxta" \
     --seed 42 \
     --early-stopping 50 \

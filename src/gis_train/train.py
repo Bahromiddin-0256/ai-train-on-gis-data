@@ -41,8 +41,6 @@ def train(cfg: DictConfig) -> dict[str, Any]:
 
     datamodule = instantiate(cfg.data)
     model = instantiate(cfg.model)
-    if torch.cuda.is_available():
-        model = torch.compile(model)
     trainer: pl.Trainer = instantiate(cfg.trainer)
 
     trainer.fit(model=model, datamodule=datamodule)
